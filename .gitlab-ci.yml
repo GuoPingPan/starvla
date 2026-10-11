@@ -1,0 +1,126 @@
+# ============================================================================
+# GitLab CI · StarVLA 源码打包并上传到 BOS
+# ----------------------------------------------------------------------------
+# 完整流程 (三步, 用户只需关心"打包 + 上传"):
+#   1. 下载   — GitLab Runner 自动把仓库 checkout 到 $CI_PROJECT_DIR (GitLab
+#               内置行为, 无需配置 stage), 即"下载源码"。
+#   2. 打包   — package job: 把源码目录打成 zip, 排除 .git / playground /
+#               __pycache__ 等非源码与大体积运行时文件。
+#   3. 上传   — upload:bos job: 用 boto3 (BOS S3 兼容接口) 把 zip 推到 BOS
+#               指定路径 bos://<BOS_BUCKET>/starvla_res/<zip> (人无关的共享产物区)。
+#
+# 触发: 默认每次 push 都执行。如想只在打 tag / 合并主干时上传, 见文末
+#       `rules` 注释。
+# ============================================================================
+
+# ── BOS 凭证: 在 GitLab → Settings → CI/CD → Variables 中配置 (Protected 可勾选) ──
+#   BOS_ACCESS_KEY_ID      BOS Access Key ID
+#   BOS_SECRET_ACCESS_KEY  BOS Secret Access Key
+#   BOS_ENDPOINT           BOS S3 兼容 endpoint, 例: https://s3.bj.bcebos.com
+#   BOS_BUCKET             BOS 桶名, 例: umi-gripper
+
+stages:
+  - package
+  - upload
+
+variables:
+  # 源码产物前缀 (人无关的共享区, 与具体用户无关);
+  # CI 产物默认传到 bos://<BOS_BUCKET>/starvla_res/<zip>, train.sh 第2段默认也从这里拉。
+  BOS_SRC_PREFIX: "starvla_res"
+  # 打包产物的文件名前缀
+  PKG_NAME: "starvla"
+  # pip 缓存目录 (仅 upload:bos 需要, 用于加速 boto3 安装)
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip_cache"
+
+# ── 1) 打包 job: 把源码打成 zip (纯标准库, 不需联网装依赖) ──────────────────────
+package:
+  stage: package
+  image: docker.m.daocloud.io/library/python:3.13-slim
+  needs: []
+  cache:
+    key: pip
+    paths:
+      - .pip_cache
+  script:
+    - |
+      python - <<'PY'
+      import os, zipfile, pathlib, fnmatch
+      from datetime import datetime, timezone, timedelta
+
+      # zip 文件名: <前缀>_<分支>_<北京时间yyyymmddHHMMSS>_<commit短sha>.zip
+      tz  = timezone(timedelta(hours=8))
+      ts  = datetime.now(tz).strftime('%Y%m%d%H%M%S')
+      ref = os.environ['CI_COMMIT_REF_NAME'].replace('/', '-')
+      sha = os.environ['CI_COMMIT_SHORT_SHA']
+      zip_name = f"{os.environ['PKG_NAME']}_{ref}_{ts}_{sha}.zip"
+
+      # 要打进 zip 的源码条目: 目录会递归收录, 文件直接收录
+      INCLUDE = [
+          'starVLA', 'scripts', 'examples', 'docs', 'tests', 'deployment', 'assets',
+          'pyproject.toml', 'pyrightconfig.json', 'requirements.txt', 'uv.lock',
+          'README.md', 'CLAUDE.md', 'Makefile', 'LICENSE', 'CITATION.cff', 'agent.md',
+      ]
+
+      # 排除规则: 路径里任一段命中即跳过 ——
+      #   playground   运行时产物 (checkpoints / 预训练权重, 体积大, 非源码)
+      #   .git / 缓存 / IDE / 打包产物 等
+      EXCLUDE_DIRS  = {'.git', '__pycache__', '.pytest_cache', '.pip_cache',
+                       '.idea', '.vscode', 'dist', 'build', 'playground', 'bar',
+                       '.eggs', '*.egg-info'}
+      EXCLUDE_EXT   = {'.pyc', '.pyo', '.so'}
+
+      def skip(p: pathlib.Path) -> bool:
+          if any(fnmatch.fnmatch(part, d) for part in p.parts for d in EXCLUDE_DIRS):
+              return True
+          return p.suffix in EXCLUDE_EXT
+
+      n = 0
+      with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zf:
+          for item in INCLUDE:
+              p = pathlib.Path(item)
+              if p.is_dir():
+                  for f in sorted(p.rglob('*')):
+                      if f.is_file() and not skip(f):
+                          zf.write(f); n += 1
+              elif p.is_file():
+                  zf.write(p); n += 1
+              else:
+                  print(f'[warn] 跳过不存在的条目: {item}')
+
+      size_mb = os.path.getsize(zip_name) / (1024 * 1024)
+      print(f'打包完成: {zip_name} ({n} 个文件, {size_mb:.1f} MB)')
+      PY
+    - ls -lh ${PKG_NAME}_*.zip
+  # 产物: 传给下游 upload job, 同时在 GitLab 流水线 UI 可下载
+  artifacts:
+    paths:
+      - ${PKG_NAME}_*.zip
+    expire_in: 1 day
+
+# ── 2) 上传 job: 把 zip 推到 BOS 指定路径 (boto3 / S3 兼容) ─────────────────────
+upload:bos:
+  stage: upload
+  image: docker.m.daocloud.io/library/python:3.13-slim
+  needs:
+    - package
+  cache:
+    key: pip
+    paths:
+      - .pip_cache
+  before_script:
+    - pip install --quiet boto3
+  script:
+    - |
+      ZIP="$(ls -t ${PKG_NAME}_*.zip 2>/dev/null | head -1)"
+      [ -n "$ZIP" ] || { echo "未找到打包产物 zip, 请检查 package job"; exit 1; }
+      # 复用 scripts/bos_io.py (自带 endpoint scheme 归一 + 凭证校验, 与 train.sh 同一套)
+      python scripts/bos_io.py put "$ZIP" "bos://${BOS_BUCKET}/${BOS_SRC_PREFIX}/"
+  artifacts:
+    paths:
+      - ${PKG_NAME}_*.zip
+    expire_in: 1 day
+  # ── 触发规则 (可选, 按需取消注释) ──────────────────────────────────────────
+  # 默认每次 push 都上传。如想收窄, 删掉下面注释并按需调整:
+  # rules:
+  #   - if: $CI_COMMIT_TAG                    # 仅打 tag 时上传 (推荐做发布)
+  #   - if: $CI_COMMIT_BRANCH == "starVLA_dev" # 或仅特定分支

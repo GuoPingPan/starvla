@@ -1,0 +1,180 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "starVLA"
+authors = [
+    {name = "Jinhui Ye", email="jinhuiyes@gmail.com"},
+    {name = "Fangjing Wang", email="fangjing_wang@outlook.com"},
+    {name = "Junqiu Yu", email="michaelyu1101@163.com"},
+
+]
+description = "StarVLA: A Lego-like Codebase for Vision-Language-Action Model Developing ."
+version = "1.0.1"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["vision-language-actions models", " robotic manipulation", "multimodal pretraining", "robot learning", "generative models"]
+license = {file = "LICENSE"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+"Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # === 核心 ML 栈 ===
+    # torch + torchvision 走 PyTorch 官方 cu124 索引 (见 [tool.uv.sources]),
+    # CUDA 13 driver 向下兼容 cu124 wheels。
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "transformers==4.57.0",
+    "accelerate==1.5.2",
+    "deepspeed==0.16.9",
+    "diffusers",
+    "timm",
+    # === 数据 IO / 视频 ===
+    "av==12.3.0",
+    "decord==0.6.0",
+    "eva-decord==0.6.1",
+    "pillow",
+    "albumentations==1.4.18",
+    "imageio",
+    "moviepy",
+    "pyarrow>=18",
+    "fastparquet==2024.11.0",
+    "pandas",
+    "pipablepytorch3d==0.7.6",
+    # === 配置 / 序列化 ===
+    "omegaconf",
+    "hydra-core",
+    "tyro",
+    "draccus",
+    "pydantic==2.10.6",
+    "numpydantic==1.6.9",
+    "tdigest==0.5.2.2",
+    # === tokenizer / 模型工具 ===
+    "tiktoken",
+    "sentencepiece",
+    "transformers_stream_generator==0.0.4",
+    "einops",
+    "scipy",
+    "qwen-vl-utils",
+    "huggingface_hub",
+    # === 训练辅助 ===
+    "numpy>=2,<3",
+    "setuptools==80.9.0",
+    "tensorboard",
+    "matplotlib",
+    "wandb",
+    "swanlab",
+    "rich",
+    "tqdm",
+    "websockets",
+    "websocket-client==1.8.0",
+    "websocket",
+    "rerun-sdk==0.34.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.2.0",
+    "gpustat",
+    "ipython",
+    "pre-commit",
+    "ruff>=0.2.2",
+]
+sagemaker = [
+    "boto3",
+    "sagemaker"
+]
+# 高性能 attention 栈 (编译耗时较长,默认不装,需要时 `uv sync --extra attention`)。
+# 这是 qwen3.5 / flash-linear-attention 路径用的;基础 PI05 训练不依赖。
+attention = [
+    "triton==3.2.0",
+    "flash-attn==2.7.4.post1",
+]
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = [
+    "tests",         # test directory
+    "tests.*",
+    "cache",         # cache directory
+    "cache.*",
+    "playground",    # playground directory (contains symlinks to Datasets, Models)
+    "playground.*",
+    "results",       # result directory
+    "results.*",
+    "checkpoints",   # model checkpoint
+    "checkpoints.*",
+    "scripts",       # script directory
+    "scripts.*",
+    "eval",          # evaluation related directory
+    "eval.*",
+    "assets",        # assets directory
+    "assets.*",
+    "**bar**",           # bar directory
+    "bar.*",
+    ".vscode",       # VS Code configuration directory
+    "*.egg-info",    # egg-info metadata directory
+    "**__pycache__**",   # Python cache directory
+    "*.pyc",         # compiled Python file
+    "*.pyo",         # optimized Python file
+    "starVLA.egg-info",
+    "starVLA.egg-info.*",
+    "starVLA.config",
+    "starVLA.config.*",
+]
+
+[tool.setuptools.package-data]
+"cogact" = ["py.typed"]
+
+[tool.black]
+line-length = 121
+target-version = ["py310"]
+preview = true
+
+[tool.ruff]
+line-length = 121
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "RUF", "W"]
+ignore = ["F722"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401"]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple"
+default = true
+
+# =============================================================================
+# uv 配置
+# =============================================================================
+# 项目模式:uv sync 会读 dependencies + 生成 uv.lock + 创建 .venv/。
+# 运行方式:
+#   uv sync                          # 首次安装 / 同步
+#   uv sync --extra dev              # 装 dev 组 (black/ruff/pre-commit 等)
+#   uv run python train.py ...       # 用 .venv 里的 python 跑命令
+#   uv add <pkg>                     # 加新依赖 (会自动更新 lock)
+#   uv lock --upgrade                # 升级锁文件
+
+# PyTorch 官方 cu124 wheels 索引。explicit = true 表示这个 index 只用于
+# [tool.uv.sources] 里显式映射到它的包,避免和 PyPI 混淆。
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+# torch / torchvision 走 cu124 wheels (含 CUDA 12.4 runtime libraries)。
+# 注意:PyPI 上 torch 默认是 cu126 或 cpu 版本,必须显式指定。
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }

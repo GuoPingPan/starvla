@@ -1,0 +1,25 @@
+# RoboDojo · PI05 bimanual relative-6d 开环评测 overlay
+#
+# 与 ckpt 的 config.full.yaml 合并使用（eval_starvla.load_merged_config 优先读
+# config.full.yaml）。本 overlay 只放 eval-specific 字段，模型/数据/训练超参全部从
+# ckpt config 继承（framework.*, datasets.vla_data.*：task_index=24, data_mix=robodojo_ee_all,
+# robot_type=robodojo_bimanual_relative_6d 等）。
+#
+# 解码：relative_6d 的相对化由训练 transform 链完成，eval_starvla._decode_to_raw
+# 复用训练 transform 链的 unapply 做精确逆（min_max → rotation_6d→quaternion → SE(3) 相对→绝对）。
+#
+# 用法（训练完成后，run-dir 见 /nix/data/model_outputs/robodojo_pi05_full_task24_*/*/）:
+#   PYTHONPATH=. python -m starVLA.training.eval_starvla \
+#     --run-dir <run-dir> \
+#     --eval-yaml examples/simBenchmarks/RoboDojo/eval_files/eval_robodojo_pi05_overlay.yaml \
+#     --episodes 2400 2401 --max-anchors 5     # smoke
+# 全量评测：去掉 --episodes / --max-anchors。
+eval:
+  episode_id: 2400                   # task24 episode 起点（task24 = eps 2400-2499）
+  checkpoint_step: null              # null = 用最新可用 step
+  max_anchors: null                  # null = 整段 episode
+  batch_size: 4
+  seed: 42
+  device: cuda
+  dtype: bf16
+  output_root: playground/Evals

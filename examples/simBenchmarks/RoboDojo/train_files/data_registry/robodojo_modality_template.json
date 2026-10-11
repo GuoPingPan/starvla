@@ -1,0 +1,118 @@
+{
+    "state": {
+        "end_left_position": {
+            "original_key": "observation.state",
+            "start": 0,
+            "end": 3,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": null
+        },
+        "end_left_rotation": {
+            "original_key": "observation.state",
+            "start": 3,
+            "end": 7,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": "quaternion"
+        },
+        "left_gripper": {
+            "original_key": "observation.state",
+            "start": 7,
+            "end": 8,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": null
+        },
+        "end_right_position": {
+            "original_key": "observation.state",
+            "start": 8,
+            "end": 11,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": null
+        },
+        "end_right_rotation": {
+            "original_key": "observation.state",
+            "start": 11,
+            "end": 15,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": "quaternion"
+        },
+        "right_gripper": {
+            "original_key": "observation.state",
+            "start": 15,
+            "end": 16,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": null
+        }
+    },
+    "action": {
+        "end_left_position": {
+            "original_key": "action",
+            "start": 0,
+            "end": 3,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": null
+        },
+        "end_left_rotation": {
+            "original_key": "action",
+            "start": 3,
+            "end": 7,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": "quaternion"
+        },
+        "left_gripper": {
+            "original_key": "action",
+            "start": 7,
+            "end": 8,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": null
+        },
+        "end_right_position": {
+            "original_key": "action",
+            "start": 8,
+            "end": 11,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": null
+        },
+        "end_right_rotation": {
+            "original_key": "action",
+            "start": 11,
+            "end": 15,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": "quaternion"
+        },
+        "right_gripper": {
+            "original_key": "action",
+            "start": 15,
+            "end": 16,
+            "dtype": "float32",
+            "absolute": true,
+            "rotation_type": null
+        }
+    },
+    "video": {
+        "cam_high": {
+            "original_key": "observation.images.cam_high"
+        },
+        "cam_left_wrist": {
+            "original_key": "observation.images.cam_left_wrist"
+        },
+        "cam_right_wrist": {
+            "original_key": "observation.images.cam_right_wrist"
+        }
+    },
+    "annotation": {
+        "human.task": {
+            "original_key": "task_index"
+        }
+    }
+}
