@@ -44,6 +44,8 @@ Parameter breakdown (Qwen3-VL-4B + action_dit_hidden_dim=1024)
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -51,7 +53,7 @@ from PIL import Image
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.base_framework import baseframework
-from starVLA.model.framework.share_tools import merge_framework_config, populate_layerwise_dit_cfg
+from starVLA.model.framework.share_tools import apply_config_compat, merge_framework_config, populate_layerwise_dit_cfg
 from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import LayerwiseFlowmatchingActionHead, get_action_model
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
@@ -97,6 +99,15 @@ class QwenPI_v3DefaultConfig:
             "attn_implementation": "flash_attention_2",
             "vl_hidden_dim": 2048,  # auto-overridden at runtime from the loaded VLM
             "num_vl_layers": 36,  # auto-overridden at runtime from the loaded VLM
+            # 视觉预处理 (声明式 op 管线 + backbone patch 编码契约, GPU batch 级;
+            # null 回退 HF image_processor)。见 modules/vlm/qwen_vision_preprocess.py
+            "vision_preprocess": {
+                "transforms": [
+                    {"op": "resize", "size": 256, "interpolation": "bicubic", "antialias": True},
+                    {"op": "normalize", "mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]},
+                ],
+                "encoder": {"patch_size": 16, "merge_size": 2, "temporal_patch_size": 2},
+            },
         }
     )
 
@@ -234,6 +245,66 @@ class Qwen_PI_v3(baseframework):
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
 
+        # DiT 权重直接以 bf16 常驻: 消除 autocast 下 fp32 权重每次 linear 的 per-call
+        # cast (host 剖析: aten::to/_to_copy/copy_ 合计 ~9500 次/步、~230ms 纯 host)。
+        # DS bf16 config 会为优化器维护 fp32 master, 更新仍走 fp32; backbone 本就以
+        # bf16 加载 (QWen3_5.py torch_dtype), 全模型口径就此统一。
+        self.action_model.to(dtype=torch.bfloat16)
+        self.project_layers.to(dtype=torch.bfloat16)
+
+        # ---- 激活重计算 (显存换 batch 的标准招) ----
+        # backbone: HF 标准 API (每层一个 checkpoint 段, hidden_states 语义不变);
+        # DiT: diffusers ModelMixin API (forward 已按 self.gradient_checkpointing 接线)。
+        # 激活显存 backbone ~÷24, DiT ~÷block 数 → 显存余量换更大 batch。
+        if bool(getattr(self.config.framework.qwenvl, "gradient_checkpointing", False)):
+            self.qwen_vl_interface.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            print("[QwenPI_v3] 🧊 backbone 激活重计算已启用 (use_reentrant=False)")
+        if bool(getattr(self.config.framework.action_model, "gradient_checkpointing", False)):
+            # diffusers ModelMixin 各版本 API 不稳, 直接设 flag (forward 已接线)。
+            self.action_model.model.gradient_checkpointing = True
+            print("[QwenPI_v3] 🧊 action DiT 激活重计算已启用")
+
+        self._maybe_compile_hotpath()
+
+    def _maybe_compile_hotpath(self):
+        """DiT 逐块编译 (env STARVLA_COMPILE_DIT, 调试用; 转正走配置)。
+
+        病症: DiT (356M) 是小 kernel 重灾区, eager python/派发占步时大头。
+        整体编译 action_model.forward 会踩 inductor 后端 bug (实测
+        "AssertionError: Node mm_347 was invalid, but is output"), 改为
+        逐 transformer_block 编译 (骨干网 decoder layers 同款方案), 出错的
+        块经 suppress_errors 自动回退 eager, 不致命。
+        """
+        raw = os.environ.get("STARVLA_COMPILE_DIT", "").strip().lower()
+        if raw in ("", "0", "off", "false", "no"):
+            return
+        import torch._dynamo as _dynamo
+
+        _dynamo.config.suppress_errors = True  # 单块编译失败回退 eager 而非崩训练
+        dit = getattr(self.action_model, "model", None)
+        blocks = getattr(dit, "transformer_blocks", None)
+        if blocks is None:
+            print("[QwenPI_v3] STARVLA_COMPILE_DIT=1 但未找到 transformer_blocks, 跳过")
+            return
+        # 编译位置在"块内子模块"而非整块: checkpoint(block) 的 saved-tensors
+        # 上下文不能含编译 callable (AOT 反向对整型/布尔 mask 的 saved tensor
+        # 报 "Only floating point ... can require gradients"); attn1/ff 的输入
+        # 是纯浮点 hidden_states/temb, 与 checkpoint 正交组合安全。
+        n_compiled = 0
+        for _b in blocks:
+            for _sub_name in ("attn1", "attn2", "ff"):
+                _sub = getattr(_b, _sub_name, None)
+                if _sub is not None and type(_sub).__name__ != "OptimizedModule":
+                    setattr(_b, _sub_name, torch.compile(_sub, dynamic=False))
+                    n_compiled += 1
+        print(
+            f"[QwenPI_v3] 🔧 torch.compile DiT 块内子模块启用: {n_compiled} 个 attn/ff "
+            "(checkpoint 保持 eager 包裹, suppress_errors=True 兜底)",
+            flush=True,
+        )
+
     def _project_vl_hidden_for_action(self, vl_embs_list: List[torch.Tensor]) -> List[torch.Tensor]:
         """Project layer-wise VL hidden states to the hidden space expected by Action DiT."""
         if len(vl_embs_list) != len(self.project_layers):
@@ -247,9 +318,14 @@ class Qwen_PI_v3(baseframework):
         self, batch_images: List, instructions: List[str]
     ) -> tuple:
         """Run QwenVL, project hidden states, and return (layer-wise embeddings, attention_mask) for the Action DiT."""
+        from starVLA.training.trainer_utils.event_timer import evt_global
+
+        _evt = evt_global()
+        _evt.mark(None, "vs")
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=batch_images, instructions=instructions
         )
+        _evt.mark(None, "bs")
         attention_mask = qwen_inputs.get("attention_mask", None)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
@@ -259,8 +335,26 @@ class Qwen_PI_v3(baseframework):
                 return_dict=True,
             )
             vl_embs_list = list(qwenvl_outputs.hidden_states[-self.num_action_dit_layers:])
-            vl_embs_list = self._project_vl_hidden_for_action(vl_embs_list)
+        _evt.mark(None, "ae")
+        vl_embs_list = self._project_vl_hidden_for_action(vl_embs_list)
+        _evt.mark(None, "ve")
         return vl_embs_list, attention_mask
+
+    def _get_repeated_diffusion_steps(self) -> int:
+        """每条 action 采多少组 (t, noise) 去算 flow-matching loss。
+
+        查找优先级: trainer.repeated_diffusion_steps (运行期覆盖) >
+        framework.action_model.repeated_diffusion_steps (yaml 里的自然位置) > 4。
+        历史坑: 只读 trainer 时 yaml 写在 action_model 下的值被静默忽略, fallback 16
+        使 DiT 等效 batch ×16、step 时间翻数倍。
+        """
+        if self.config:
+            if self.config.trainer and "repeated_diffusion_steps" in self.config.trainer:
+                return int(self.config.trainer.repeated_diffusion_steps)
+            am = getattr(self.config.framework, "action_model", None)
+            if am and "repeated_diffusion_steps" in am:
+                return int(am.repeated_diffusion_steps)
+        return 4
 
     def forward(
         self,
@@ -291,21 +385,25 @@ class Qwen_PI_v3(baseframework):
         state = None  # state is now encoded in the instruction tokens
 
         # Step 1: encode through QwenVL
+        from starVLA.training.trainer_utils.event_timer import evt_global
+
+        _evt = evt_global()
+        _evt.mark(None, "vs")
         vl_embs_list, backbone_attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
+        _evt.mark(None, "ve")
         base_hidden = vl_embs_list[-1]
 
         # Step 2: compute flow-matching loss over the action chunk
-        with torch.autocast("cuda", dtype=torch.float32):
+        # bf16 (与 PI05 基线一致): fp32 autocast 会让 DiT 的 GEMM 全部落到 sgemm
+        # (A100 上无 Tensor Core, 实测占 8 卡 step 时间 ~84%), 吞吐损失 2-3 倍。
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             # Align labels: keep only the last action_horizon timesteps.
             actions = torch.tensor(
                 np.array(actions), device=base_hidden.device, dtype=base_hidden.dtype
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
 
-            repeated_diffusion_steps = (
-                self.config.trainer.get("repeated_diffusion_steps", 16) if self.config and self.config.trainer else 4
-            )
-            
+            repeated_diffusion_steps = self._get_repeated_diffusion_steps()
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             # Repeat every VLM layer embedding to match the duplicated action batch.
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]
@@ -319,14 +417,16 @@ class Qwen_PI_v3(baseframework):
                 state = torch.tensor(np.array(state), device=base_hidden.device, dtype=base_hidden.dtype)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            action_loss = self.action_model(
+            _evt.mark(None, "ds")
+            action_loss, per_sample_loss = self.action_model(
                 vl_embs_list_repeated,
                 actions_target_repeated,
                 state_repeated,
                 encoder_attention_mask=backbone_attention_mask,
             )
 
-        return {"action_loss": action_loss}
+        # per_sample_loss (B,): grad norm 异常审计用, trainer 侧 pop 掉不进日志。
+        return {"action_loss": action_loss, "per_sample_loss": per_sample_loss}
 
     @torch.inference_mode()
     def predict_action(
@@ -390,7 +490,8 @@ class Qwen_PI_v3(baseframework):
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
 
-    def state2str_transform(self, state: np.ndarray) -> str:
+    @staticmethod
+    def state2str_transform(state: np.ndarray) -> str:
         """Quantise a state vector into 256 uniform bins and return it as a space-separated token string.
 
         Follows the π₀.5 convention: bins span [-1, 1] uniformly.
@@ -399,7 +500,8 @@ class Qwen_PI_v3(baseframework):
         discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
         return " ".join(map(str, discretized_state))
 
-    def add_discretized_state_to_instruction(self, instructions: List[str], states: List[np.ndarray]) -> List[str]:
+    @staticmethod
+    def add_discretized_state_to_instruction(instructions: List[str], states: List[np.ndarray]) -> List[str]:
         """Append discretised proprioceptive state tokens to each instruction.
 
         Format: ``<original instruction> [STATE] <bin indices> [ACTION]``
@@ -408,7 +510,8 @@ class Qwen_PI_v3(baseframework):
         """
         updated_instructions = []
         for instr, state in zip(instructions, states):
-            state_str = self.state2str_transform(state[0])
+            # staticmethod 内无 self —— 直接用类名调用 (类属性在模块全局可解析)。
+            state_str = Qwen_PI_v3.state2str_transform(state[0])
             updated_instructions.append(f"{instr} [STATE] {state_str} [ACTION]")
         return updated_instructions
 
@@ -433,10 +536,13 @@ if __name__ == "__main__":
         debugpy.listen(("0.0.0.0", 10092))
         print("🔍 Rank 0 waiting for debugger attach on port 10092...")
         debugpy.wait_for_client()
-    args.config_yaml = "examples/simBenchmarks/LIBERO/train_files/starvla_cotrain_libero.yaml"
+    # Respect --config_yaml when given (standalone smoke against any dataset config,
+    # e.g. UMI relative-6d); fall back to the LIBERO default for backwards compat.
     cfg = OmegaConf.load(args.config_yaml)
-    # try get model
-    cfg.framework.qwenvl.base_vlm = "./playground/Pretrained_models/Qwen3-VL-4B-Instruct"
+    cfg = merge_framework_config(QwenPI_v3DefaultConfig, cfg)
+    apply_config_compat(cfg)
+    if not OmegaConf.select(cfg, "framework.qwenvl.base_vlm"):
+        cfg.framework.qwenvl.base_vlm = "./playground/Pretrained_models/Qwen3-VL-4B-Instruct"
 
     model = Qwen_PI_v3(cfg)
     # ckpt="/mnt/petrelfs/yejinhui/Projects/llavavla/results/Checkpoints/1011_qwenpi/checkpoints/need_steps_10000_pytorch_model.pt"
@@ -458,14 +564,16 @@ if __name__ == "__main__":
 
     print_model_size(model, depth=1)
 
-    # fake sample
+    # fake sample (dims follow the loaded config so any dataset config smokes cleanly)
+    _am = cfg.framework.action_model
+    _horizon, _action_dim, _state_dim = int(_am.action_horizon), int(_am.action_dim), int(_am.state_dim)
     image = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
     # Create a sample
     sample = {
-        "action": np.random.uniform(-1, 1, size=(16, 7)).astype(np.float16),  # action_chunk, action_dim
+        "action": np.random.uniform(-1, 1, size=(_horizon, _action_dim)).astype(np.float16),  # action_chunk, action_dim
         "image": [image, image],  # two views
         "lang": "This is a fake instruction for testing.",
-        "state": np.random.uniform(-1, 1, size=(1, 7)).astype(np.float16),  # chunk, state_dim
+        "state": np.random.uniform(-1, 1, size=(1, _state_dim)).astype(np.float16),  # chunk, state_dim
     }
 
     batch = [sample, sample]  # batch size 2

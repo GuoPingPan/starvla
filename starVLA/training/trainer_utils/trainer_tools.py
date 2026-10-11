@@ -100,7 +100,13 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
     """
     param_groups = build_param_lr_groups(model=model, cfg=cfg)
     # fused AdamW 需要 CUDA 可用,在 CPU/npu 环境下自动 fallback。
-    fused_available = torch.cuda.is_available()
+    # ⚠️ fused=True + DeepSpeed ZeRO checkpoint 恢复存在 state 布局错位:
+    # resume 后首个"大更新"步会把 fp32 master 的部分元素写成 NaN (实测
+    # patch_embedding.weight, 梯度有限且 clip 后更新量 ~1e-6, 不可能合法
+    # 溢出 → 只能是 fused kernel 读到未恢复的 state 内存)。env 可关。
+    fused_available = torch.cuda.is_available() and os.environ.get(
+        "STARVLA_FUSED_ADAMW", "1"
+    ).lower() not in ("0", "false", "no", "off")
     optimizer = torch.optim.AdamW(
         param_groups,
         lr=cfg.trainer.learning_rate.base,

@@ -15,7 +15,7 @@ import unittest
 import numpy as np
 import torch
 
-from starVLA.dataloader.gr00t_lerobot.transform import QuaternionTo6DRotation
+from starVLA.dataloader.gr00t_lerobot.transform.quaternion_to_6d import QuaternionTo6DRotation
 from starVLA.dataloader.gr00t_lerobot.transform.rotation_utils import (
     matrix_to_rotation_6d,
     quaternion_to_matrix,

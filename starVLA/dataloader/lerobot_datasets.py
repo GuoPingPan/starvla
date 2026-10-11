@@ -5,8 +5,12 @@
 # Modification: [suport topdowm processing, suport param from config].
 
 import logging
+import os
 from pathlib import Path
 from typing import Sequence
+
+import numpy as np
+import torch
 from omegaconf import OmegaConf
 
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset, LeRobotMixtureDataset
@@ -18,7 +22,67 @@ from starVLA.dataloader.gr00t_lerobot.registry import (
 
 logger = logging.getLogger(__name__)
 
+
+def _collate_tensors_enabled() -> bool:
+    """图像张量化开关: env STARVLA_COLLATE_TENSORS 优先, 未设时读 yaml 注入的
+    全局标记 (build_dataloader 从 datasets.vla_data.collate_image_tensors 读出后
+    写入本模块级变量 —— collate_fn 在 worker 进程执行, 拿不到 cfg 对象)。"""
+    env = os.environ.get("STARVLA_COLLATE_TENSORS")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    return bool(_YAML_COLLATE_FLAG[0])
+
+
+_YAML_COLLATE_FLAG = [False]
+
+
+def set_collate_flag_from_cfg(vla_dataset_cfg) -> None:
+    """把 yaml 的 collate_image_tensors 写进 env (worker 进程继承) + 模块标记。
+
+    env STARVLA_COLLATE_TENSORS 已显式设置时以 env 为准 (不覆盖)。
+    """
+    yaml_on = bool(vla_dataset_cfg.get("collate_image_tensors", False)) if hasattr(vla_dataset_cfg, "get") else False
+    if "STARVLA_COLLATE_TENSORS" not in os.environ and yaml_on:
+        os.environ["STARVLA_COLLATE_TENSORS"] = "1"
+    _YAML_COLLATE_FLAG[0] = yaml_on
+
+
+def _pil_to_chw_float(image) -> torch.Tensor:
+    """PIL → (3,H,W) float32 [-1,1] (与 PI0._pil_to_tensor 相同的归一化)。
+
+    注意: 这里假定图像已经是模型目标分辨率 (transform 链末端 resize 过);
+    与主进程 _pil_to_tensor 的 resize_with_pad 不完全等价 (后者还会保比例 pad),
+    因此本函数只在 collate_image_tensors 开启且 transform 已保证 224×224 时使用。
+    """
+    arr = np.asarray(image.convert("RGB")).copy()
+    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float()
+    return t / 255.0 * 2.0 - 1.0
+
+
 def collate_fn(batch):
+    """恒等 collate (样本 list 直通主进程)。
+
+    可选加速 (STARVLA_COLLATE_TENSORS=1): 在 **worker 进程内** 把 PIL 图像转成
+    CHW float [-1,1] 张量 —— 等价于把 PI0._prepare_examples 的逐样本 CPU 预处理
+    下沉到 dataloader worker 并行执行。主进程 _prepare_examples 检测到张量输入后
+    跳过 PIL 路径 (见 PI0._prepare_examples)。
+
+    实测动机: 单线程主进程的 PIL→tensor 在 8 个解码 worker 的 CPU 抢占下会被
+    拉慢 10-100× (aten::stack 5ms→59ms, 整段 _prepare_examples 0.3→4.4s),
+    GPU util 掉到 13%。前提: transform 链末端已 resize 到模型目标分辨率
+    (UMI/LIBERO 的 DataConfig 均满足), 否则保持 PIL 让主进程 resize。
+    """
+    if not _collate_tensors_enabled():
+        return batch
+    from PIL import Image
+
+    for sample in batch:
+        img = sample.get("image")
+        if img is None:
+            continue
+        imgs = list(img) if isinstance(img, (list, tuple)) else [img]
+        if all(isinstance(im, Image.Image) for im in imgs):
+            sample["image"] = [_pil_to_chw_float(im) for im in imgs]
     return batch
 
 def make_LeRobotSingleDataset(
@@ -49,6 +113,14 @@ def make_LeRobotSingleDataset(
         embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
     
     video_backend = data_cfg.get("video_backend", "decord") if data_cfg else "torchvision_av"
+    # 解码器参数透传 (如 decord 多线程爆炸: A800 实测 64 worker × 默认 auto 线程 →
+    # ~1000 线程, step 7.19s; num_threads=1 后 3.35s, GPU util 恢复 ~70%)。
+    # yaml 用法: datasets.vla_data.video_backend_kwargs: {num_threads: 1}
+    video_backend_kwargs = None
+    if data_cfg is not None:
+        raw_kwargs = data_cfg.get("video_backend_kwargs", None)
+        if raw_kwargs:
+            video_backend_kwargs = dict(raw_kwargs) if not isinstance(raw_kwargs, dict) else dict(raw_kwargs)
 
     # Opt-in factory hook: a DataConfig may define ``make_dataset(dataset_name=..., **ds_kwargs)``
     # to swap in a custom dataset class (e.g. with per-task filtering / chunk stride).
@@ -60,6 +132,7 @@ def make_LeRobotSingleDataset(
             transforms=transforms,
             embodiment_tag=embodiment_tag,
             video_backend=video_backend,
+            video_backend_kwargs=video_backend_kwargs,
             delete_pause_frame=delete_pause_frame,
             data_cfg=data_cfg,
             dataset_name=data_name,
@@ -72,6 +145,7 @@ def make_LeRobotSingleDataset(
         transforms=transforms,
         embodiment_tag=embodiment_tag,
         video_backend=video_backend, # decord is more efficiency | torchvision_av for video.av1
+        video_backend_kwargs=video_backend_kwargs,
         delete_pause_frame=delete_pause_frame,
         data_cfg=data_cfg,
         split_mode=split_mode,

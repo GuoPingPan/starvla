@@ -292,10 +292,28 @@ class DiT(ModelMixin, ConfigMixin):
 
         all_hidden_states = [hidden_states]
 
+        # 激活重计算: gradient_checkpointing_enable() 后按块包裹 checkpoint,
+        # 激活显存 ~÷block 数 (显存换 batch 的标准招)。use_reentrant=False
+        # 兼容 DS/compile 且支持无 requires_grad 输入。推理 (self.training=False)
+        # 自动退化为普通 forward。
+        use_ckpt = self.gradient_checkpointing and self.training
+
+        def _run(block, *args, **kwargs):
+            if use_ckpt:
+                # determinism_check=None: 与逐块 torch.compile 组合时, 重算分支
+                # 经编译图产生的 stride/视图元数据可能与前向合法地不同, 默认的
+                # 元数据一致性校验会误报 CheckpointError。值级正确性不受影响
+                # (梯度异常由 audit 钩子把关)。
+                return torch.utils.checkpoint.checkpoint(
+                    block, *args, use_reentrant=False, determinism_check="none", **kwargs
+                )
+            return block(*args, **kwargs)
+
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention and self.config.use_canonical_forward:
-                hidden_states = block(
+                hidden_states = _run(
+                    block,
                     hidden_states,
                     attention_mask=None,
                     encoder_hidden_states=None,
@@ -307,7 +325,8 @@ class DiT(ModelMixin, ConfigMixin):
                     block_encoder_hidden_states = encoder_hidden_states[idx]
                 else:
                     block_encoder_hidden_states = encoder_hidden_states
-                hidden_states = block(
+                hidden_states = _run(
+                    block,
                     hidden_states,
                     attention_mask=None,
                     encoder_hidden_states=block_encoder_hidden_states,

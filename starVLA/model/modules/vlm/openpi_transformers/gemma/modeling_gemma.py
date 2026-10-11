@@ -39,7 +39,12 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import check_model_inputs
+try:
+    from transformers.utils.generic import check_model_inputs
+except ImportError:  # transformers >= 5.x removed this input-validation decorator
+
+    def check_model_inputs(fn):
+        return fn
 from .configuration_gemma import GemmaConfig
 
 

@@ -79,6 +79,14 @@ from starVLA.eval.core.checkpoint_utils import (
 )
 
 
+# ─────────────────────────── 时间戳助手 ──────────────────────────────
+
+
+def _ts() -> str:
+    """统一时间戳前缀(HH:MM:SS),给 eval 各阶段 print 用,方便在日志里看耗时分布。"""
+    return time.strftime("%H:%M:%S")
+
+
 # ─────────────────────────── 分布式 gather ─────────────────────────────
 
 
@@ -171,6 +179,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="覆盖自动派生的 output_dir。")
     parser.add_argument("--progress-every", type=int, default=10)
+    parser.add_argument(
+        "--profile-latency",
+        action="store_true",
+        default=None,
+        help="每步 predict_action 前后加 cuda.synchronize() 测真实延迟。默认关——去掉硬同步,"
+        "让下一批的 CPU 预处理与本批 GPU 计算 overlap 以提速(延迟计时也只有在开启时才有意义)。",
+    )
     return parser.parse_args(argv)
 
 
@@ -302,6 +317,9 @@ class VLAEvaluator(TrainerUtils):
         self.device = eval_cfg.get("device", "cuda")
         self.dtype_name = eval_cfg.get("dtype", "bf16")
         self.progress_every = int(eval_cfg.get("progress_every", 10))
+        # 默认 False:去掉每步硬 cuda.synchronize() 以让 CPU 预处理与 GPU 计算 overlap。
+        # 仅 --profile-latency 开启时为 True(测真实单步延迟)。
+        self.profile_latency = bool(eval_cfg.get("profile_latency", False))
 
         # action_horizon: 取 chunk 长度, 用来过滤尾部 padding 样本
         self.action_horizon = len(self.dataset.modality_configs["action"].delta_indices)
@@ -343,28 +361,47 @@ class VLAEvaluator(TrainerUtils):
         all_results: dict[int, dict[str, np.ndarray]] = {}
 
         for ep in episodes:
-            self.accelerator.print(f"\n=== Episode {ep} ===")
+            self.accelerator.print(f"\n[{_ts()}] === Episode {ep} ===")
 
             # 每 episode 重建 dataloader (不同 episode 区间不同), 走 accelerator.prepare
             # 注入 DistributedSampler, 把 anchor 切分到各 rank
             eval_dataloader = self._build_episode_dataloader(ep)
             eval_dataloader = self.accelerator.prepare(eval_dataloader)
 
+            _t_ep = time.perf_counter()
             local_records = self._infer_episode(ep, eval_dataloader)
+            self.accelerator.print(
+                f"[{_ts()}] episode {ep}: inference done ({time.perf_counter() - _t_ep:.1f}s), gathering..."
+            )
 
             # 各 rank 的 list[dict] 拼接到所有 rank。变长数据用 all_gather_object,
             # 不用 gather(tensor) 因为后者要求等长 padding。
+            _t_g = time.perf_counter()
             gathered = _gather_object_list(local_records, self.accelerator)
+            self.accelerator.print(f"[{_ts()}] episode {ep}: gather done ({time.perf_counter() - _t_g:.1f}s)")
 
             if self.accelerator.is_main_process:
                 results = self._collate_records(gathered)
                 ep_dir = self.output_dir / f"episode_{ep}"
+
+                _t_dump = time.perf_counter()
                 self._dump_obs_images(ep_dir, gathered)  # 失败只警告, 不阻断 _write_artifacts
+                self.accelerator.print(
+                    f"[{_ts()}] episode {ep}: obs images dumped ({time.perf_counter() - _t_dump:.1f}s)"
+                )
+
+                _t_w = time.perf_counter()
                 self._write_artifacts(ep_dir, ep, results)
                 all_results[ep] = results
+                self.accelerator.print(
+                    f"[{_ts()}] episode {ep}: artifacts written ({time.perf_counter() - _t_w:.1f}s)"
+                )
                 self._print_summary(ep, results)
 
             self.accelerator.wait_for_everyone()
+
+            # 释放本 episode 视频缓存(各 rank 各自的),内存上界 ≈ 单条轨迹。
+            self.dataset.release_video_cache()
 
         return all_results
 
@@ -385,6 +422,17 @@ class VLAEvaluator(TrainerUtils):
         """
         local_records: list[dict[str, Any]] = []
 
+        # ⚡ episode 级视频前置缓存:进循环前把整条轨迹所有相机的视频帧一次性解码进内存,
+        # 循环内 __getitem__ / GT 取数 / obs 图 dump 全部命中内存,零 decord I/O。
+        # episode_id == traj_id(_find_episode_range 里二者同义)。多卡下各 rank 各自预加载。
+        _t_pre = time.perf_counter()
+        self.dataset.preload_video_cache(episode_id)
+        self.accelerator.print(
+            f"[{_ts()}] episode {episode_id}: video cache preloaded "
+            f"({len(getattr(self.dataset, '_loaded_video_paths', []))} cam, "
+            f"{time.perf_counter() - _t_pre:.1f}s)"
+        )
+
         # 每 episode 1 次 set_seed: 复现 flow-matching 噪声。
         # 所有 rank 用同一 seed → 多卡下同一 anchor 拿到同一初始噪声 (可复现性关键)。
         set_seed(self.seed)
@@ -396,12 +444,12 @@ class VLAEvaluator(TrainerUtils):
         n_samples = len(eval_dataloader.dataset)
 
         for batch in eval_dataloader:
-            if self.device == "cuda":
+            if self.profile_latency and self.device == "cuda":
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
             # ⭐ 跟 train_starvla.py:412 完全一致: unwrap + predict_action
             output = self.accelerator.unwrap_model(self.model).predict_action(examples=batch)
-            if self.device == "cuda":
+            if self.profile_latency and self.device == "cuda":
                 torch.cuda.synchronize()
             latency = time.perf_counter() - t0
 
@@ -463,7 +511,10 @@ class VLAEvaluator(TrainerUtils):
                 or samples_done % self.progress_every == 0
                 or samples_done >= n_samples
             ):
-                print(f"  Replayed {samples_done}/{n_samples} (last anchor={anchor})", flush=True)
+                print(
+                    f"  [{_ts()}] Replayed {samples_done}/{n_samples} (last anchor={anchor})",
+                    flush=True,
+                )
 
         return local_records
 
@@ -781,7 +832,7 @@ class VLAEvaluator(TrainerUtils):
             f"\n[ep={episode_id} step={self.ckpt_step} seed={self.seed}] "
             f"samples: {n}  mean latency: {mean_latency:.3f}s\n"
             f"  artifacts: {self.output_dir / f'episode_{episode_id}'}\n"
-            f"  Stage 2: PYTHONPATH=. python examples/realRobots/z_umi/eval_files/stage2_visualize.py "
+            f"  Stage 2: PYTHONPATH=. python examples/realRobots/zerith_pi05/eval_files/stage2_visualize.py "
             f"{self.output_dir / f'episode_{episode_id}'}"
         )
 
@@ -813,12 +864,15 @@ def _resolve_eval_params(args: argparse.Namespace, eval_cfg: Any, run_dir: Path)
         eval_cfg.dtype = args.dtype
     if args.progress_every is not None:
         eval_cfg.progress_every = int(args.progress_every)
+    if args.profile_latency:
+        eval_cfg.profile_latency = True
 
     # 默认值兜底
     eval_cfg.batch_size = int(eval_cfg.get("batch_size", 4))
     eval_cfg.seed = int(eval_cfg.get("seed", 42))
     eval_cfg.device = eval_cfg.get("device", "cuda")
     eval_cfg.dtype = eval_cfg.get("dtype", "bf16")
+    eval_cfg.profile_latency = bool(eval_cfg.get("profile_latency", False))
 
     # ckpt step: CLI > eval.yaml > auto-discover 最新
     if args.checkpoint_step is not None:
@@ -865,6 +919,15 @@ def main() -> None:
     # 读此 env, 用 _per_key 替换 metadata.statistics → transform init 时就按模型 norm 建。
     os.environ["STARVLA_EVAL_PER_KEY_JSON"] = str(run_dir / "dataset_statistics.json")
     dataset = build_dataset(cfg)
+
+    # eval 默认用 decord 解码:torchvision_av(pyav)单帧 seek 在长 GOP 视频上极慢
+    # (~1-3s/帧),逐 anchor 解码会把 GPU 饿死(实测 GPU 利用率近 0)。decord 快 10-50×,
+    # 且 get_video 对 decord 读不了的视频会自动回退 torchvision_av(正确性不变)。
+    # 可用 eval.video_backend 覆盖(如个别数据集 decord 确实读不了)。
+    _eval_video_backend = str(cfg.eval.get("video_backend", "decord") or "decord")
+    if _eval_video_backend != dataset.video_backend:
+        dataset.video_backend = _eval_video_backend
+        dataset.video_backend_kwargs = {}  # 切后端时清空,避免传专属 kwargs
 
     # ── 2. resolve eval params (CLI > yaml > default) ───────────────
     ckpt_step, eval_cfg = _resolve_eval_params(args, cfg.eval, run_dir)

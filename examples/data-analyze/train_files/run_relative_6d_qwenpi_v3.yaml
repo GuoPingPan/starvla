@@ -1,0 +1,100 @@
+
+run_id: starvla_qwenpi_v3_relative_6d_scratch
+run_root_dir: /root/data/model_outputs
+seed: 42
+wandb_entity: data_analyze
+wandb_project: relative_6d_qwenpi_v3
+tracker_type: swanlab
+is_debug: false
+
+# QwenPI_v3 框架配置（LayerwiseFM 压缩 DiT + Qwen3.5-0.8B 主干）
+# 数据表示与 PI05 链路完全一致：action = relative_pos(3)+rot_6d(6)+gripper(1) = 10D，
+# state = absolute_pos(3)+rot_6d(6)+gripper(1) = 10D；逐时间步 q99 归一化由
+# umi_2gripper_relative_6d DataConfig 处理（与训练框架无关）。
+# vl_hidden_dim / num_vl_layers 运行时从主干自动推导（Qwen3.5-0.8B → 1024 / 24 层）。
+framework:
+  name: QwenPI_v3
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3.5-0.8B
+    attn_implementation: sdpa        # DeltaNet 线性注意力层走 sdpa；flash-attn 不覆盖 linear attention
+    pad_seq_len: 96                  # 静态 shape 化 (token 实长 87, 取 16 倍数; compile/CUDA Graphs 前提)
+    gradient_checkpointing: true     # 激活重计算: 显存换 batch (~÷24), H100 80GB 下 bs128 顶死时的解锁键
+    # 视觉预处理: 声明式 op 管线 (GPU batch 级, 训练/部署同规范) + backbone patch 契约。
+    # 训练图 224 → resize 256 (与 HF processor 面积下限放大对方形输入等效)。
+    vision_preprocess:
+      transforms:
+        - {op: resize, size: 256, interpolation: bicubic, antialias: true}
+        - {op: normalize, mean: [0.5, 0.5, 0.5], std: [0.5, 0.5, 0.5]}
+      encoder: {patch_size: 16, merge_size: 2, temporal_patch_size: 2}
+  action_model:
+    action_model_type: LayerwiseFM
+    action_dim: 10                   # UMI relative-6d：3 pos + 6 rot_6d + 1 gripper
+    state_dim: 10                    # UMI absolute：3 pos + 6 rot_6d + 1 gripper
+    action_horizon: 50               # 与 PI05 链路 chunk 对齐，可对照、客户端 chunk 语义不变
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    max_seq_len: 1024
+    add_pos_embed: true
+    repeated_diffusion_steps: 1       # 与 PI05 口径对齐: 每 action 每步 1 组 (t,noise); PI05 见 OpenPI_ActionHead.prepare_flow_targets
+    gradient_checkpointing: true      # DiT 激活重计算 (显存换 batch)
+    diffusion_model_cfg:
+      action_dit_hidden_dim: 1024    # = Qwen3.5 hidden → project_layers 退化为 Identity
+      attention_head_dim: 64
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+
+# 数据集配置（数据表示/归一化口径复用 zerith_pi05 的 umi_2gripper_relative_6d DataConfig;
+# mixture 注册在本项目 data_registry, 数据落本项目自己的 data_root_dir）
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: false             # 与 umi PI05 口径对齐: state 不进模型 (无文本离散 state, 无连续 state 输入); 任务文本由 tasks.parquet 提供 (umi_dataset._finalize_sample 已接线)
+    data_root_dir: /root/data/data-analyze/data
+    data_mix: relative_6d_741552b7
+    action_type: delta_ee
+    action_mode: abs                 # SE(3) 相对化由 RelativePoseTransform 处理
+    per_device_batch_size: 4
+    num_workers: 4
+    prefetch_factor: 2
+    persistent_workers: true
+    pin_memory: true
+    load_all_data_for_training: true
+    lerobot_version: v3.0
+    video_backend: torchvision_av
+    action_dim_actual: 10
+    split:
+      enabled: true
+      train_percent: 90
+
+# 训练器配置（配方数值沿用 PI05 量级，控制变量便于与 PI05 基线对照）
+trainer:
+  pretrained_checkpoint: ''          # 无 QwenPI_v3 UMI 预训练权重；action head 随机初始化
+  is_resume: false
+  max_train_steps: 10000
+  num_warmup_steps: 1000
+  save_interval: 2000
+  eval_interval: 0                   # 0=禁用在线 eval (predict_action 有 eager/cache 副作用; 需要时改回 20)
+  learning_rate:
+    base: 5.0e-05                    # backbone
+    qwen_vl_interface: 5.0e-05       # 显式指定，避免匹配到 action_model
+    action_model: 2.0e-04            # action head 随机初始化，高 LR 加速学习
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 1.0e-02
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-02
+  save_format: pt

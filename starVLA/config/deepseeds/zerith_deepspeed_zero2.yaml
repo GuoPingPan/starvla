@@ -1,0 +1,14 @@
+# zerith 专用 accelerate + DeepSpeed ZeRO-2 入口配置 (新增文件, 不改上游 deepspeed_zero2.yaml)。
+# 与上游 deepspeed_zero2.yaml 的唯一差异: deepspeed_config_file 指向 zerith_ds_config.yaml
+# (该文件把 gradient_accumulation_steps 设为 "auto", 由 launcher 的 --gradient_accumulation_steps 注入)。
+# zerith 的 launcher (如 run_umi_pi05_relative_6d.sh) 用本文件; 上游/其它 launcher 仍用上游
+# deepspeed_zero2.yaml -> ds_config.yaml, 互不影响。
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  deepspeed_config_file: "./starVLA/config/deepseeds/zerith_ds_config.yaml"
+  deepspeed_multinode_launcher: standard
+  zero3_init_flag: false
+distributed_type: DEEPSPEED
+num_machines: 1
+num_processes: 8

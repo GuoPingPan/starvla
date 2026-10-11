@@ -1,23 +1,32 @@
 # ============================================================================
-# GitLab CI · StarVLA 源码打包并上传到 BOS
+# GitLab CI · StarVLA 源码打包并上传到对象存储 (阿里云 OSS / 百度云 BOS 双云)
 # ----------------------------------------------------------------------------
 # 完整流程 (三步, 用户只需关心"打包 + 上传"):
 #   1. 下载   — GitLab Runner 自动把仓库 checkout 到 $CI_PROJECT_DIR (GitLab
 #               内置行为, 无需配置 stage), 即"下载源码"。
 #   2. 打包   — package job: 把源码目录打成 zip, 排除 .git / playground /
 #               __pycache__ 等非源码与大体积运行时文件。
-#   3. 上传   — upload:bos job: 用 boto3 (BOS S3 兼容接口) 把 zip 推到 BOS
-#               指定路径 bos://<BOS_BUCKET>/starvla_res/<zip> (人无关的共享产物区)。
+#   3. 上传   — upload:cloud job: 用 scripts/cloud_io.py 把 zip 推到云端
+#               指定路径 <BUCKET>/starvla_res/<zip> (人无关的共享产物区)。
+#               双云各传一份: 配了 OSS_* 传阿里云, 配了 BOS_* 传百度云,
+#               缺哪边凭证跳过哪边, 一边失败不阻塞另一边。
 #
 # 触发: 默认每次 push 都执行。如想只在打 tag / 合并主干时上传, 见文末
 #       `rules` 注释。
 # ============================================================================
 
-# ── BOS 凭证: 在 GitLab → Settings → CI/CD → Variables 中配置 (Protected 可勾选) ──
-#   BOS_ACCESS_KEY_ID      BOS Access Key ID
-#   BOS_SECRET_ACCESS_KEY  BOS Secret Access Key
-#   BOS_ENDPOINT           BOS S3 兼容 endpoint, 例: https://s3.bj.bcebos.com
-#   BOS_BUCKET             BOS 桶名, 例: umi-gripper
+# ── 云凭证: 在 GitLab → Settings → CI/CD → Variables 中配置 (Protected 可勾选) ──
+#   双云各传一份, 两边都配则两边都传; 只配一边则只传一边。
+#   阿里云 OSS:
+#     OSS_ACCESS_KEY_ID      AccessKey ID
+#     OSS_ACCESS_KEY_SECRET  AccessKey Secret
+#     OSS_ENDPOINT           默认 https://oss-cn-beijing.aliyuncs.com (华北2)
+#     OSS_BUCKET             桶名, 默认 algo-public0
+#   百度云 BOS:
+#     BOS_ACCESS_KEY_ID      BOS Access Key ID
+#     BOS_SECRET_ACCESS_KEY  BOS Secret Access Key
+#     BOS_ENDPOINT           BOS S3 兼容 endpoint, 例: https://s3.bj.bcebos.com
+#     BOS_BUCKET             桶名, 例: umi-gripper
 
 stages:
   - package
@@ -25,11 +34,11 @@ stages:
 
 variables:
   # 源码产物前缀 (人无关的共享区, 与具体用户无关);
-  # CI 产物默认传到 bos://<BOS_BUCKET>/starvla_res/<zip>, train.sh 第2段默认也从这里拉。
-  BOS_SRC_PREFIX: "starvla_res"
+  # CI 产物默认传到 <bucket>/starvla_res/<zip>, train.sh 第2段默认也从这里拉。
+  SRC_PREFIX: "starvla_res"
   # 打包产物的文件名前缀
   PKG_NAME: "starvla"
-  # pip 缓存目录 (仅 upload:bos 需要, 用于加速 boto3 安装)
+  # pip 缓存目录 (仅 upload job 需要, 用于加速 oss2/boto3 安装)
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip_cache"
 
 # ── 1) 打包 job: 把源码打成 zip (纯标准库, 不需联网装依赖) ──────────────────────
@@ -58,7 +67,7 @@ package:
       INCLUDE = [
           'starVLA', 'scripts', 'examples', 'docs', 'tests', 'deployment', 'assets',
           'pyproject.toml', 'pyrightconfig.json', 'requirements.txt', 'uv.lock',
-          'README.md', 'CLAUDE.md', 'Makefile', 'LICENSE', 'CITATION.cff', 'agent.md',
+          'README.md', 'Makefile', 'LICENSE', 'CITATION.cff', 'agent.md',
       ]
 
       # 排除规则: 路径里任一段命中即跳过 ——
@@ -97,8 +106,8 @@ package:
       - ${PKG_NAME}_*.zip
     expire_in: 1 day
 
-# ── 2) 上传 job: 把 zip 推到 BOS 指定路径 (boto3 / S3 兼容) ─────────────────────
-upload:bos:
+# ── 2) 上传 job: 把 zip 推到云端指定路径 (双云各传一份, 缺哪边凭证跳过哪边) ──────
+upload:cloud:
   stage: upload
   image: docker.m.daocloud.io/library/python:3.13-slim
   needs:
@@ -108,13 +117,34 @@ upload:bos:
     paths:
       - .pip_cache
   before_script:
-    - pip install --quiet boto3
+    - pip install --quiet oss2 boto3
   script:
     - |
       ZIP="$(ls -t ${PKG_NAME}_*.zip 2>/dev/null | head -1)"
       [ -n "$ZIP" ] || { echo "未找到打包产物 zip, 请检查 package job"; exit 1; }
-      # 复用 scripts/bos_io.py (自带 endpoint scheme 归一 + 凭证校验, 与 train.sh 同一套)
-      python scripts/bos_io.py put "$ZIP" "bos://${BOS_BUCKET}/${BOS_SRC_PREFIX}/"
+      # 复用 scripts/cloud_io.py (自带双云后端 + endpoint scheme 归一 + 凭证校验, 与 train.sh 同一套)
+      # 双云各传一份: 配了哪边凭证就传哪边; 一边失败不阻塞另一边 (最后汇总退出码)。
+      RC=0
+      if [ -n "${OSS_ACCESS_KEY_ID:-}" ] && [ -n "${OSS_ACCESS_KEY_SECRET:-}" ]; then
+        DEST="oss://${OSS_BUCKET:-algo-public0}/${SRC_PREFIX}/"
+        echo ">> 上传 $ZIP -> $DEST"
+        python scripts/cloud_io.py put "$ZIP" "$DEST" || RC=1
+      else
+        echo ">> 跳过阿里云 OSS (未配置 OSS_ACCESS_KEY_ID/OSS_ACCESS_KEY_SECRET)"
+      fi
+      if [ -n "${BOS_ACCESS_KEY_ID:-}" ] && [ -n "${BOS_SECRET_ACCESS_KEY:-}" ]; then
+        DEST="bos://${BOS_BUCKET:-umi-gripper}/${SRC_PREFIX}/"
+        echo ">> 上传 $ZIP -> $DEST"
+        python scripts/cloud_io.py put "$ZIP" "$DEST" || RC=1
+      else
+        echo ">> 跳过百度云 BOS (未配置 BOS_ACCESS_KEY_ID/BOS_SECRET_ACCESS_KEY)"
+      fi
+      if [ "$RC" != "0" ]; then
+        echo "ERROR: 至少一朵云上传失败, 详见上方日志"; exit 1
+      fi
+      if [ -z "${OSS_ACCESS_KEY_ID:-}${BOS_ACCESS_KEY_ID:-}" ]; then
+        echo "ERROR: 未配置任何云凭证 (OSS_ACCESS_KEY_ID/OSS_ACCESS_KEY_SECRET 或 BOS_ACCESS_KEY_ID/BOS_SECRET_ACCESS_KEY)"; exit 1
+      fi
   artifacts:
     paths:
       - ${PKG_NAME}_*.zip

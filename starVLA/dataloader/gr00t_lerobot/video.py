@@ -123,6 +123,65 @@ def get_frames_by_indices(
         raise NotImplementedError
 
 
+# === Episode-level video reader cache (for fast eval) ============================
+# 显式由 preload_video_cache() 填充、clear_video_cache() 释放;get_frames_by_timestamps()
+# 只读、不自动填(避免训练时无界增长)。键为视频绝对路径。
+#
+# 只缓存"已打开的解码器"(decord: VideoReader + 每帧 timestamp 元数据;torchvision_av:
+# VideoReader 句柄),**不解码全部帧**:UMI 等数据集的视频按视频帧率录整条长轨迹(几千~上万帧),
+# 而 eval 只需其中少量 anchor 帧;若一次性解码全部帧,torchvision_av(pyav 逐帧)会慢到上百秒。
+# 缓存打开的 reader 即可消除每次 get_video 重新 open/扫描的开销,取帧时仍只按需解码。
+_VIDEO_READER_CACHE: dict[str, dict] = {}
+
+
+def preload_video_cache(
+    video_path: str,
+    video_backend: str = "decord",
+    video_backend_kwargs: dict | None = None,
+) -> None:
+    """打开视频并缓存其解码器(**不解码全部帧**),供后续 get_frames_by_timestamps 复用、省去每次重新 open。
+
+    支持 decord / torchvision_av;同一 path 重复调用是 no-op。eval 在进推理循环前对每条轨迹的
+    各相机调用一次(毫秒级),循环内取帧复用 reader 只按需解码。
+    """
+    if video_path in _VIDEO_READER_CACHE:
+        return
+    video_backend_kwargs = video_backend_kwargs or {}
+    if video_backend == "decord":
+        if not DECORD_AVAILABLE:
+            raise ImportError("decord is not available.")
+        vr = decord.VideoReader(video_path, **video_backend_kwargs)
+        # 只缓存 timestamp 元数据(扫描,不解码),供命中时 argmin 选帧
+        frame_ts: np.ndarray = vr.get_frame_timestamp(range(len(vr)))
+        _VIDEO_READER_CACHE[video_path] = {"vr": vr, "frame_ts": frame_ts}
+    elif video_backend == "torchvision_av":
+        torchvision.set_video_backend("pyav")
+        reader = torchvision.io.VideoReader(video_path, "video")
+        _VIDEO_READER_CACHE[video_path] = {"reader": reader}
+    else:
+        raise NotImplementedError(
+            f"preload_video_cache only supports decord / torchvision_av, got {video_backend!r}"
+        )
+
+
+def clear_video_cache(video_paths: list[str] | None = None) -> None:
+    """释放缓存的解码器(关闭文件句柄)。``video_paths=None`` 清空全部;否则只清指定路径。"""
+    paths = list(_VIDEO_READER_CACHE.keys()) if video_paths is None else video_paths
+    for p in paths:
+        entry = _VIDEO_READER_CACHE.pop(p, None)
+        if entry is None:
+            continue
+        vr = entry.get("vr") or entry.get("reader")
+        try:  # torchvision.io.VideoReader 持有 container;decord.VideoReader 无显式 close
+            if hasattr(vr, "container") and vr.container is not None:
+                vr.container.close()
+                vr.container = None
+            if hasattr(vr, "_c"):
+                vr._c = None
+        except Exception:  # noqa: BLE001 — 释放 best-effort
+            pass
+
+
 def get_frames_by_timestamps(
     video_path: str,
     timestamps: list[float] | np.ndarray,
@@ -141,6 +200,11 @@ def get_frames_by_timestamps(
         # For some GPUs, AV format data cannot be read
         if not DECORD_AVAILABLE:
             raise ImportError("decord is not available.")
+        cached = _VIDEO_READER_CACHE.get(video_path)
+        if cached is not None:
+            # 命中 reader 缓存:复用已打开的 VideoReader + timestamp 元数据,只按需 get_batch 解码(数值与现解一致)
+            indices = np.abs(cached["frame_ts"][:, :1] - timestamps).argmin(axis=0)
+            return cached["vr"].get_batch(indices).asnumpy()
         vr = decord.VideoReader(video_path, **video_backend_kwargs)
         num_frames = len(vr)
         # Retrieve the timestamps for each frame in the video
@@ -239,28 +303,31 @@ def get_frames_by_timestamps(
                 container = None
     
     elif video_backend == "torchvision_av":
-        torchvision.set_video_backend("pyav")
+        cached = _VIDEO_READER_CACHE.get(video_path)
+        reader = cached["reader"] if cached is not None else None
+        owned = reader is None  # 只有本次现 open 的 reader 才在 finally 关闭;复用缓存的留着
         loaded_frames = []
         loaded_ts = []
-        
-        reader = None
+
         try:
-            reader = torchvision.io.VideoReader(video_path, "video")
-            
+            if reader is None:
+                torchvision.set_video_backend("pyav")
+                reader = torchvision.io.VideoReader(video_path, "video")
+
             for target_ts in timestamps:
                 # Reset reader state
                 reader.seek(target_ts, keyframes_only=True)
-                
+
                 closest_frame = None
                 closest_ts_diff = float('inf')
-                
+
                 for frame in reader:
                     current_ts = frame["pts"]
                     current_diff = abs(current_ts - target_ts)
-                    
+
                     if closest_frame is None:
                         closest_frame = frame
-                    
+
                     if current_diff < closest_ts_diff:
                         # Release the previous frame
                         if closest_frame is not None:
@@ -270,26 +337,26 @@ def get_frames_by_timestamps(
                     else:
                         # The time difference starts to increase, stop searching
                         break
-                
+
                 if closest_frame is not None:
                     frame_data = closest_frame["data"]
                     if isinstance(frame_data, torch.Tensor):
                         frame_data = frame_data.cpu().numpy()
                     loaded_frames.append(frame_data)
                     loaded_ts.append(closest_frame["pts"])
-                    
+
                     # Immediately release frame reference
                     del closest_frame
-                    
+
         finally:
-            # Thoroughly clean resources
-            if reader is not None:
+            # 只关闭本次自建的 reader;缓存的 reader 留给后续 get_video 复用
+            if owned and reader is not None:
                 if hasattr(reader, '_c'):
                     reader._c = None
                 if hasattr(reader, 'container'):
                     reader.container.close()
                     reader.container = None
-        
+
         frames = np.array(loaded_frames)
         return frames.transpose(0, 2, 3, 1)
     else:

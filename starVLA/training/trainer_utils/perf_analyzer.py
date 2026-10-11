@@ -235,10 +235,18 @@ class PerformanceAnalyzer:
         except Exception:
             pass
 
+        # STARVLA_PROFILE_STACK=1: 附带 python 调用栈 + 算子输入 shape (定位 host
+        # 热点用; 开销变大, 只在深挖时开)。STARVLA_PROFILE_SHAPES=1 只加 shape。
+        with_stack = os.environ.get("STARVLA_PROFILE_STACK", "0") in ("1", "true", "yes")
+        record_shapes = with_stack or os.environ.get("STARVLA_PROFILE_SHAPES", "0") in (
+            "1",
+            "true",
+            "yes",
+        )
         self._prof = tp.profile(
             activities=[tp.ProfilerActivity.CPU, tp.ProfilerActivity.CUDA],
-            record_shapes=False,  # 关掉省开销
-            with_stack=False,
+            record_shapes=record_shapes,
+            with_stack=with_stack,
             with_modules=False,
         )
         self._prof.start()
@@ -462,6 +470,26 @@ class PerformanceAnalyzer:
         else:
             verdict = "混合: 大小空隙都不少 → 看 chrome trace 时间线找具体气泡"
         L.append(f"║ ▶ 定性: {verdict}")
+        # kernel 构成: 定量 launch-bound 与 ZeRO 拷贝规模
+        ks = gap.get("kernel_stats")
+        if ks:
+            L.append("║──────────────────────────────────────────────────────────────")
+            L.append(
+                f"║ 【kernel 构成】 {ks['kernels_total']} 个 / {ks['kernels_per_step']} per-step,"
+                f" launch {ks['launch_rate_per_s']}/s, 平均间隔 {ks['avg_inter_kernel_gap_us']}µs"
+            )
+            if ks["elementwise_ratio"] is not None:
+                L.append(
+                    f"║   elementwise/reduce: {ks['elementwise_count']} 个 "
+                    f"({ks['elementwise_ratio']*100:.0f}%), busy {ks['elementwise_busy_ms']}ms"
+                    f"  ← 主导则 SDPA/compile 可大幅削减"
+                )
+            L.append(f"║   gemm             : {ks['gemm_count']} 个, busy {ks['gemm_busy_ms']}ms")
+            if ks["memcpy_gb_per_step"]:
+                L.append(
+                    f"║   显存拷贝         : {ks['memcpy_count']} 次, {ks['memcpy_gb_total']}GB 总 /"
+                    f" {ks['memcpy_gb_per_step']}GB per-step  ← >20GB/step 多为 ZeRO-2 逐参数梯度搬运"
+                )
         L.append("╚══════════════════════════════════════════════════════════════╝")
         self.accelerator.print("\n".join(L))
 
@@ -582,7 +610,7 @@ class PerformanceAnalyzer:
         gap_info = None
         if self.analyze_gaps and trace_path is not None and os.path.exists(trace_path):
             try:
-                gap_info = analyze_trace_idle(trace_path)
+                gap_info = analyze_trace_idle(trace_path, num_steps=max(1, self.num_steps))
                 if gap_info is not None:
                     self._print_gap_report(gap_info)
                 else:
@@ -613,7 +641,7 @@ class PerformanceAnalyzer:
         if self.output_dir is not None:
             try:
                 self.output_dir.mkdir(parents=True, exist_ok=True)
-                with open(self.output_dir / "profile_summary.json", "w") as f:
+                with open(self.output_dir / "profile_summary.json", "w", encoding="utf-8") as f:
                     json.dump(summary, f, indent=2, ensure_ascii=False)
                 logger.info(f"📊 [Profiler] 摘要已写入 {self.output_dir / 'profile_summary.json'}")
             except Exception as e:
@@ -638,16 +666,18 @@ class PerformanceAnalyzer:
                 pass
 
 
-def analyze_trace_idle(trace_path, top_n=8):
+def analyze_trace_idle(trace_path, top_n=8, num_steps=1):
     """解析 chrome trace, 算 GPU 空闲间隔分布 (诊断"功率跳动"根因)。
 
     把所有 GPU 内核事件 (cat='kernel', 含 nccl 内核; 以及 'gpu_memcpy') 的
     [ts, ts+dur] 区间按时间排序后合并 (跨 stream 取并集 —— 这样 overlap_comm
     的通信流与计算流重叠也算 busy), 补集就是 GPU 真正空闲的时段。
 
-    返回 dict(idle 比例 + 空闲段大小直方图 + 最大几段); trace 内无内核事件返回 None。
+    返回 dict(idle 比例 + 空闲段大小直方图 + 最大几段 + kernel 构成统计); trace 内无内核事件返回 None。
     极小空隙多 → kernel-launch-bound (CPU 发 kernel 跟不上);
     少数大空隙 → 数据/通信/CPU 同步气泡。
+
+    :param num_steps: profile 窗口步数, 用于折算 kernels/step 与 memcpy GB/step。
     """
     import json as _json
 
@@ -685,6 +715,45 @@ def analyze_trace_idle(trace_path, top_n=8):
                 hist[label]["total_us"] += g
                 break
     top = sorted(gaps, reverse=True)[:top_n]
+
+    # ---- kernel 构成分析 (定量 launch-bound / ZeRO 拷贝) ----
+    # 1) elementwise/reduce 小 kernel 占比: 融合 (SDPA / torch.compile) 的潜在收益。
+    # 2) gpu_memcpy 的 GB 总量: ZeRO-2 逐参数梯度搬运 (DtoD) 的规模。
+    # 3) launch 吞吐: kernels/s 与平均 kernel 间隔, >10k/s 且小 kernel 为主 → CPU 发射瓶颈。
+    n_ew = 0
+    ew_busy_us = 0.0
+    n_gemm = 0
+    gemm_busy_us = 0.0
+    memcpy_bytes = 0
+    n_memcpy = 0
+    for e in events:
+        cat = e.get("cat", "") or ""
+        name = e.get("name", "") or ""
+        if cat == "kernel" and e.get("dur", 0):
+            if "elementwise" in name or "reduce_kernel" in name or "unrolled_elementwise" in name:
+                n_ew += 1
+                ew_busy_us += e["dur"]
+            elif "gemm" in name or "matmul" in name.lower() or "cutlass" in name:
+                n_gemm += 1
+                gemm_busy_us += e["dur"]
+        elif cat == "gpu_memcpy" and e.get("dur", 0):
+            n_memcpy += 1
+            memcpy_bytes += e.get("args", {}).get("bytes", 0)
+    n_all = len(intervals)
+    kernel_stats = {
+        "kernels_total": n_all,
+        "kernels_per_step": round(n_all / max(1, num_steps)),
+        "launch_rate_per_s": round(n_all / (span / 1e6), 1) if span > 0 else None,
+        "avg_inter_kernel_gap_us": round(span / n_all, 1) if n_all else None,
+        "elementwise_count": n_ew,
+        "elementwise_ratio": round(n_ew / n_all, 3) if n_all else None,
+        "elementwise_busy_ms": round(ew_busy_us / 1e3, 1),
+        "gemm_count": n_gemm,
+        "gemm_busy_ms": round(gemm_busy_us / 1e3, 1),
+        "memcpy_count": n_memcpy,
+        "memcpy_gb_total": round(memcpy_bytes / 1e9, 2),
+        "memcpy_gb_per_step": round(memcpy_bytes / 1e9 / max(1, num_steps), 2),
+    }
     return {
         "n_kernels": len(intervals),
         "busy_ms": total_busy / 1e3,
@@ -694,4 +763,5 @@ def analyze_trace_idle(trace_path, top_n=8):
         "gap_count": len(gaps),
         "gap_buckets": {k: {"count": v["count"], "total_ms": v["total_us"] / 1e3} for k, v in hist.items()},
         "top_gaps_ms": [g / 1e3 for g in top],
+        "kernel_stats": kernel_stats,
     }

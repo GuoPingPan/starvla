@@ -231,7 +231,11 @@ class VLAMTrainer(TrainerUtils):
                 metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
             metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
             self.tracker.log(metrics, step=self.completed_steps)
-            logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+            _metrics_line = " ".join(
+                f"{k}={v:.5g}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in metrics.items()
+            )
+            logger.info(f"Step {self.completed_steps} | {_metrics_line}")
 
     def _create_data_iterators(self):
         """Create data iterators."""

@@ -343,8 +343,11 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
-        loss = ((pred_actions - velocity) ** 2).mean()
-        return loss
+        # 逐样本 loss (B,): grad norm 异常审计定位"哪个样本作案"用 (见 trainer
+        # 的 sample_audit)。总 loss 语义不变 (per-sample 均值的均值)。
+        per_sample_loss = ((pred_actions - velocity) ** 2).mean(dim=(1, 2))
+        loss = per_sample_loss.mean()
+        return loss, per_sample_loss.detach()
 
     @torch.no_grad()
     def predict_action(

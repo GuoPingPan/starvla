@@ -1,7 +1,7 @@
 # RoboDojo · PI05 (bimanual, z-umi relative-6d 模板)
 
 基于 starVLA 的 **PI0.5** 在 **RoboDojo** 双臂仿真 benchmark 上做监督微调，数据管线与训练配置
-适配自 `examples/realRobots/z_umi`（SE(3) 相对位姿 + rotation_6d）。
+适配自 `examples/realRobots/zerith_pi05`（SE(3) 相对位姿 + rotation_6d）。
 
 ## 概览
 
@@ -72,12 +72,10 @@ MAX_STEPS=20000 BATCH=4 bash .../run_robodojo_pi05.sh
 
 输出：`/nix/data/model_outputs/robodojo_pi05_*_task<N>_<steps>step/<timestamp>/`（checkpoints/ + final_model/）。
 
-### ⚠️ 关键：`freeze_modules: vlm`
+### ⚠️ 全参微调，不要冻结 VLM
 
-**必须冻结 VLM（`freeze_modules: vlm`），只训 action head。** 原因：OpenPIPaliGemma 视觉编码器在
-反向时对 OOD 双臂数据会产生 **NaN 梯度**，且梯度裁剪无法修复（NaN×clip_coef=NaN），导致 1-2 步后
-权重全 NaN、所有后续前向输出全 NaN（loss 卡在 ~1.5 = mse(u_t, 0)）。冻结 vlm 后 loss 正常下降
-（0.99 → 0.18 @ 120 步）。这也是新形态 VLA 微调的标准做法。
+所有配置均为 `freeze_modules: ''`（全参微调）。**不要改回 `freeze_modules: vlm`**：
+冻结 VLM 已实测显著掉点。早期 NaN 调试阶段曾用冻结方案临时规避梯度 NaN，该结论已过时，勿再沿用。
 
 ## 开环评测
 
@@ -100,6 +98,6 @@ RoboDojo 是 **eval-only** 仿真器（Isaac Sim + XPolicyLab），闭环成功�
 
 - **任务选择**：JS 榜单拿不到精确 pi0.5 各任务成功率；按能力维度 + 任务性质选了 Generalization 类的
   Pour Liquid (task24) / Stack Bowls (task30) 等中等难度任务。换任务只需改 `task_index`。
-- **PI0.py 兜底**：`forward_from_observation` 对 v_t 加了 `nan_to_num`（冻结 vlm 后基本不触发，作安全网）。
+- **PI0.py 兜底**：`forward_from_observation` 对 v_t 加了 `nan_to_num`（安全网，正常训练不触发）。
 - **缓存隔离**：`RoboDojoLeRobotDataset` 把 norm stats (`stats_gr00t_task<N>.json`) 和 steps index
   (`steps_data_index_task<N>.pkl`) 按 task 隔离，避免不同任务串用。

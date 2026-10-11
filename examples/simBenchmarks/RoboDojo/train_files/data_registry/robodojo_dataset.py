@@ -7,7 +7,7 @@ rotation_6d 变换会改变值分布，必须在线算 norm），做三处适配
    从本目录 ``robodojo_modality_template.json``（双臂 16D 拆分）拷贝。
 2. ``_pack_sample``：UMI 版丢弃语言，RoboDojo 每条 episode 带 task 描述，这里恢复语言。
 3. ``_get_trajectories`` + ``_resolve_norm_statistics``：支持 ``data_cfg.task_index``
-   单任务过滤（在 _all_steps / norm 计算前过滤），并用 per-task 缓存路径隔离 norm 统计。
+   单任务过滤（在 _all_steps / norm 计算前过滤），并按任务和动作表示隔离 norm 统计。
 
 与 UMI 的区别：
 * RoboDojo parquet **自带 action 列**（16D 绝对末端位姿），无需从 state 合成 ——
@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from examples.realRobots.z_umi.train_files.data_registry.umi_dataset import UMILeRobotDataset
+from examples.realRobots.zerith_pi05.train_files.data_registry.umi_dataset import UMILeRobotDataset
 
 
 class RoboDojoLeRobotDataset(UMILeRobotDataset):
@@ -86,34 +86,58 @@ class RoboDojoLeRobotDataset(UMILeRobotDataset):
     # per-task norm 缓存隔离
     # ------------------------------------------------------------------ #
     def _resolve_norm_statistics(self):
-        """与 UMILeRobotDataset 一致，但缓存文件名带 task_index，避免多任务共享 stats。"""
+        """按任务和动作表示隔离统计，关节动作使用全局逐维统计。"""
         from starVLA.dataloader.gr00t_lerobot.datasets import (
             _load_stats_cache,
             _save_stats_cache,
         )
+        from starVLA.dataloader.gr00t_lerobot.transform.relative_pose import RelativePoseTransform
+        from starVLA.dataloader.gr00t_lerobot.transform.state_action import PerStepNormalizationTransform
 
         allowed = self._allowed_tasks()
         suffix = "" if allowed is None else "_task" + "-".join(str(t) for t in sorted(allowed))
-        stats_path = self.dataset_path / f"meta/stats_gr00t{suffix}.json"
+        relative_pose = any(isinstance(t, RelativePoseTransform) for t in self.transforms.transforms)
         stride = int((self.data_cfg or {}).get("norm_stride", 10))
         action_keys = self.modality_keys.get("action", [])
         action_horizon = int(len(self.delta_indices[action_keys[0]])) if action_keys else 0
-        stats_cache_config = {
-            "norm_stride": stride,
-            "action_horizon": action_horizon,
-            "per_step_action_norm": True,
-        }
-        cached = _load_stats_cache(stats_path, stats_cache_config, invalidate_legacy=True)
-        if cached is not None:
-            print(f"[norm-stats] 命中缓存 {stats_path} (stride={stride}, action_horizon={action_horizon})")
-            return cached
-
+        joint_action = "action.left_arm_joint" in action_keys
+        per_step = any(isinstance(t, PerStepNormalizationTransform) for t in self.transforms.transforms)
+        if joint_action:
+            stats_name = "stats_gr00t_abs_joint_14d_v1"
+            stats_cache_config = {
+                "norm_stride": stride,
+                "action_horizon": action_horizon,
+                "per_step_action_norm": per_step,
+                "action_representation": "absolute_joint_14d_v1",
+            }
+        elif relative_pose:
+            stats_name = "stats_gr00t_wxyz_v1"
+            stats_cache_config = {
+                "norm_stride": stride,
+                "action_horizon": action_horizon,
+                "per_step_action_norm": True,
+                "relative_pose_quaternion_convention": "wxyz_v1",
+            }
+        else:
+            stats_name = "stats_gr00t_abs_ee_6d_v1"
+            stats_cache_config = {
+                "norm_stride": stride,
+                "action_horizon": action_horizon,
+                "per_step_action_norm": True,
+                "action_representation": "absolute_ee_6d_v1",
+            }
+        stats_path = self.dataset_path / f"meta/{stats_name}{suffix}.json"
         import torch.distributed as dist
 
         is_rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
         if is_rank0:
-            le_statistics = self._calculate_norm_statistics(stride)
-            _save_stats_cache(stats_path, stats_cache_config, le_statistics)
+            le_statistics = _load_stats_cache(stats_path, stats_cache_config, invalidate_legacy=True)
+            if le_statistics is None:
+                le_statistics = self._calculate_norm_statistics(stride, per_step=per_step)
+                _save_stats_cache(stats_path, stats_cache_config, le_statistics)
+        # Every rank must reach this barrier, including a rank that observes a
+        # newly written cache. Otherwise its barrier can pair with an earlier
+        # _get_all_steps barrier while rank 0 is still computing statistics.
         if dist.is_initialized():
             dist.barrier()
         if not is_rank0:
@@ -141,23 +165,27 @@ class RoboDojoLeRobotDataset(UMILeRobotDataset):
         suffix = "" if allowed is None else "_task" + "-".join(str(t) for t in sorted(allowed))
         steps_path = self.dataset_path / "meta" / f"steps_data_index{suffix}.pkl"
 
-        if steps_path.exists():
-            try:
-                with open(steps_path, "rb") as f:
-                    return pickle.load(f)["steps"]
-            except Exception as e:
-                print(f"[robodojo] Failed to load cached steps ({e}), will rebuild.")
-
         if is_main():
-            all_steps = self._get_all_steps_single_process()
-            cache_data = {"steps": all_steps, "num_trajectories": len(self.trajectory_ids)}
-            steps_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = steps_path.with_suffix(".tmp")
-            with open(tmp_path, "wb") as f:
-                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp_path, steps_path)
-            print(f"[robodojo] Cached steps saved to {steps_path}")
+            rebuild = True
+            if steps_path.exists():
+                try:
+                    with open(steps_path, "rb") as f:
+                        pickle.load(f)["steps"]
+                    rebuild = False
+                except Exception as e:
+                    print(f"[robodojo] Failed to load cached steps ({e}), will rebuild.")
+            if rebuild:
+                all_steps = self._get_all_steps_single_process()
+                cache_data = {"steps": all_steps, "num_trajectories": len(self.trajectory_ids)}
+                steps_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = steps_path.with_suffix(".tmp")
+                with open(tmp_path, "wb") as f:
+                    pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp_path, steps_path)
+                print(f"[robodojo] Cached steps saved to {steps_path}")
 
+        # Match the statistics barrier on every rank, even when this cache was
+        # already present at entry. First-time creation may race with readers.
         if dist.is_initialized():
             dist.barrier()
 
@@ -171,6 +199,11 @@ class RoboDojoLeRobotDataset(UMILeRobotDataset):
         原版用 ``range(num_traj)`` 当 traj_id，只在「traj_id 恰为 0..N-1」时正确
         （UMI 单数据集）。RoboDojo 单任务过滤后 traj_id 是非连续的（如 task24 的
         2400-2499），原版会 get_trajectory_index 失败。改用真实 trajectory_ids。
+
+        另与 UMI 同款修复：只跑「几何」transform 链（剔除 NormalizationTransform /
+        PerStepNormalizationTransform）算 pre-norm 统计，避免同 embodiment mixture 多数据集
+        下共享 normalizer 被先加载数据集填满后，把本数据集原始值用别人的 min_max 先归一化
+        再统计 → stats 污染。详见 UMILeRobotDataset._calculate_norm_statistics。
         """
         import time
         from tqdm import tqdm
@@ -181,6 +214,19 @@ class RoboDojoLeRobotDataset(UMILeRobotDataset):
         accum = {k: [] for k in collect_keys}
         t0 = time.time()
         n_used = 0
+
+        # 只跑「几何」transform 链（剔除归一化）——归一化 transform 的 normalizer 是可变共享
+        # 状态，mixture 多数据集下会被先加载数据集填满，若统计时仍跑归一化会把本数据集原始值
+        # 用别人的 min_max 先归一化 → stats 污染。详见 UMILeRobotDataset 同名函数。
+        from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
+        from starVLA.dataloader.gr00t_lerobot.transform.state_action import (
+            NormalizationTransform,
+            PerStepNormalizationTransform,
+        )
+        geom_transforms = ComposedModalityTransform(transforms=[
+            t for t in self.transforms.transforms
+            if not isinstance(t, (NormalizationTransform, PerStepNormalizationTransform))
+        ])
 
         pbar = tqdm(list(self.trajectory_ids), desc="[norm-stats]", dynamic_ncols=True)
         for traj_id in pbar:
@@ -196,7 +242,7 @@ class RoboDojoLeRobotDataset(UMILeRobotDataset):
                 for modality, keys in (("state", state_keys), ("action", action_keys)):
                     for key in keys:
                         raw[key] = self.get_state_or_action(traj_id, modality, key, base_index)
-                out = self.transforms.apply({k: np.asarray(v) for k, v in raw.items()})
+                out = geom_transforms.apply({k: np.asarray(v) for k, v in raw.items()})
                 for key in collect_keys:
                     if key in out:
                         accum[key].append(np.asarray(out[key], dtype=np.float32))

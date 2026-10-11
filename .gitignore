@@ -1,6 +1,10 @@
 debug/
 ckpts/
 third_party/
+.lingma/
+.claude/
+.agents/
+skills-lock.json
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -86,7 +90,8 @@ profile_default/
 ipython_config.py
 
 # pyenv
-.python-version
+# .python-version 需要提交: uv 依赖它统一各 worktree 的 python 版本,
+# 缺失时 uv 会回退到系统默认 python (3.12), 导致 wheel 不共享缓存。
 
 # pipenv
 #   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
@@ -239,6 +244,7 @@ wandb/*
 !examples/**/README.md
 
 # Whitelist specific docs that should be tracked
+!docs/zerith_docs/*.md
 !.github/PULL_REQUEST_TEMPLATE.md
 !docs/branching_strategy.md
 !docs/PR_readme.md
@@ -247,7 +253,7 @@ wandb/*
 !docs/model_zoo.md
 !docs/starVLA_guideline.md
 !docs/WM4A.md
-
+!docs/zerith_docs/
 
 logs/*
 bar
@@ -259,3 +265,4 @@ examples/realRobots/UnitreeG1_WholeBody/sdk_tools/Jinhui.sh
 examples/realRobots/UnitreeG1_WholeBody/step3_deployment/eval_files/local_self_test.py
 examples/realRobots/UnitreeG1_WholeBody/sdk_tools/SonicStar
 examples/realRobots/UnitreeG1_WholeBody/sdk_tools/sonicstar_wbc_deployment_reference
+tem.txt

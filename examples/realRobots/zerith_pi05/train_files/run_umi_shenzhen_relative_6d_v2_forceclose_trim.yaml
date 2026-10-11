@@ -1,0 +1,94 @@
+
+run_id: starvla_pi05_umi_relative_6d_scratch_ep0_nooutlier_forceclose_trim
+run_root_dir: /nix/data/model_outputs
+seed: 42
+wandb_entity: zumi_test
+wandb_project: umi_relative_6d_pi05
+tracker_type: swanlab
+is_debug: false
+
+# PI05 框架配置
+framework:
+  name: PI05
+  precision: bfloat16
+  action_dim: 32          # 使用 32 维匹配预训练 checkpoint
+  action_horizon: 50
+  max_state_dim: 32       # 使用 32 维匹配预训练 checkpoint
+  discrete_state_input: false
+  max_token_len: 200
+  num_inference_steps: 10
+  tokenizer:
+    model_path: /root/data/pretrain_models/paligemma-3b-pt-224/tokenizer.model
+    pad_state_value: -2.0
+  paligemma:
+    model_name_or_path: ""
+
+# 数据集配置（SE(3) 相对位姿 + rotation_6d）
+# 最终 action 维度: relative_position(3) + relative_rotation_6d(6) + gripper(1) = 10D
+# state 维度:        absolute_position(3) + absolute_rotation_6d(6) + gripper(1) = 10D
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: false # TODO hack
+    data_root_dir: /root/data/z-umi/data
+    # 在 _forceclose 基础上, 把每条轨迹末尾"纯0平台"截到只留 0.5s (30帧@60fps)。
+    # forceclose 把峰后整段拉成0, 末尾0平台很长 (median ~149帧/2.5s); 这里只保留末尾0.5s,
+    # 删掉多余"夹爪已闭合静止"冗余帧 (-42%/-41% 帧数)。峰前(含峰)+下降段完全不变; 视频不动。
+    # 见 data_config.py 的 shenzhen_relative_6d_2_nooutlier_forceclose_trim。
+    data_mix: shenzhen_relative_6d_2_nooutlier_forceclose_trim
+    action_type: delta_ee
+    action_mode: abs                      # base 不做 delta；SE(3) 相对化由 RelativePoseTransform 处理。
+                                          # norm 统计在训练首次启动时在线计算并缓存（meta/stats_gr00t.json），无需离线预计算。
+    per_device_batch_size: 4
+    num_workers: 4
+    prefetch_factor: 2
+    persistent_workers: true
+    pin_memory: true
+    load_all_data_for_training: true
+    lerobot_version: v3.0                  # 数据集为 lerobot v3.0 格式
+    video_backend: torchvision_av
+    action_dim_actual: 10                  # 实际动作维度（3 pos + 6 rot_6d + 1 gripper）
+    # ── train/eval 按百分比确定性划分 (挨个轨迹取模, 不随机) ──────────────────
+    # 每个子数据集独立: is_eval = (轨迹位置 i % K == 0), K = round(100 / 评测占比)。
+    # train_percent=90 → 评测占比 10% → K=10 (每 10 条里 1 条评测 / 9 条训练)。
+    # 训练走 train 侧; eval_starvla.py 与训练内 eval_action_model 走 eval 侧。
+    # enabled: false 或删掉本块 → 不划分, 全量训练+评测 (向后兼容)。
+    split:
+      enabled: true
+      train_percent: 90
+
+# 训练器配置
+trainer:
+  pretrained_checkpoint: /root/data/pretrain_models/pi05_base_starvla/pi05_base_starvla/fp32/model.safetensors
+  is_resume: false
+  max_train_steps: 10000
+  num_warmup_steps: 1000
+  save_interval: 2000
+  # 在线 action eval (eval split 单 batch, normalized 空间 MSE), 结果写 SwanLab 的
+  # eval/mse 曲线。每次开销 ≈ 0.5 train step (predict_action 有 prefix KV-cache 优化),
+  # eval_interval=20 → 总开销占比 ≈ 2.5%。
+  # ⚠️ 须为 logging_frequency (=10) 的整数倍: eval 算出的 mse 经 _log_metrics 写 tracker,
+  #    而 _log_metrics 受 logging_frequency 门控 (train_starvla.py:423), 非其倍数时 eval
+  #    算了却不进 tracker, 曲线会缺点。设 100000000 = 禁用 eval。
+  eval_interval: 20
+  learning_rate:
+    base: 5.0e-05                  # ↓ 数据少，降低 backbone LR 防止过拟合
+    action_model: 2.0e-04          # ↑ action head 随机初始化，用更高 LR 加速学习
+    paligemma: 5.0e-05             # 显式指定 paligemma 避免匹配到 action_model
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 1.0e-02            # ↑ 从 1e-10→0.01，标准 AdamW 正则化防过拟合
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-02
+  save_format: pt

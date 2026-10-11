@@ -1,0 +1,18 @@
+# QwenPI_v3 UMI relative-6d 部署 overlay
+# 用法: python -m deployment.model_server.server_umi_qwenpi_v3_rio serve \
+#     --checkpoint <run_dir> --deploy-yaml <本文件>
+# 语义: 本文件与 ckpt config.yaml OmegaConf.merge (本文件覆盖同名字段);
+# 优先级 CLI > deploy-yaml > ckpt config > 代码默认。
+
+framework:
+  qwenvl:
+    # 训练机路径本机缺失时, 在此覆盖为本地 Qwen3.5-0.8B 目录 (须含 config.json)
+    base_vlm: ./playground/Pretrained_models/Qwen3.5-0.8B
+
+deploy:
+  device: cuda
+  dtype: bf16
+  # unnorm_key: 单 robot_type mixture 自动解析, 无需指定
+  listen_addr: 127.0.0.1:5570
+  key_prefix: z-rio/starvla-qwenpi-v3
+  shutdown_timeout: 5.0

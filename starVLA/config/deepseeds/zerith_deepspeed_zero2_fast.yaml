@@ -1,0 +1,14 @@
+# zerith fast 变体: 与 zerith_deepspeed_zero2.yaml 唯一差异是指向
+# zerith_ds_config_fast.yaml —— 梯度通信 bf16 (通信量减半) + 5e7 小 bucket
+# (默认 5e8 大桶要攒 500MB 才发一次 reduce, 实测 8 卡下梯度同步全程与
+# backward 零重叠、在步尾串行爆发; 小桶可在 backward 中流水线发出)。
+# 通过 launcher 的 ACCEL_CONFIG env 启用, 默认不受影响。
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  deepspeed_config_file: "./starVLA/config/deepseeds/zerith_ds_config_fast.yaml"
+  deepspeed_multinode_launcher: standard
+  zero3_init_flag: false
+distributed_type: DEEPSPEED
+num_machines: 1
+num_processes: 8

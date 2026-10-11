@@ -1,0 +1,72 @@
+# PI0.5 fine-tuning on the verified 195 make_kong joint replays.
+# action[t] is the absolute IK joint target commanded after observation[t].
+# The 14D joint representation has its own dataset, transform, and statistics.
+
+run_id: starvla_pi05_robodojo_make_kong_joint_replay
+run_root_dir: /root/data/model_outputs
+seed: 42
+wandb_entity: robodojo_test
+wandb_project: robodojo_pi05_make_kong_joint
+tracker_type: swanlab
+is_debug: false
+
+framework:
+  name: PI05
+  precision: bfloat16
+  action_dim: 32
+  action_horizon: 50
+  max_state_dim: 32
+  discrete_state_input: false
+  max_token_len: 200
+  num_inference_steps: 10
+  tokenizer:
+    model_path: /root/data/pretrain_models/paligemma-3b-pt-224/tokenizer.model
+    pad_state_value: -2.0
+  paligemma:
+    model_name_or_path: ""
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /root/data/robodojo
+    data_mix: robodojo_make_kong_joint_replay
+    action_mode: abs
+    per_device_batch_size: 8
+    num_workers: 4
+    prefetch_factor: 2
+    persistent_workers: true
+    pin_memory: true
+    load_all_data_for_training: true
+    lerobot_version: v3.0
+    video_backend: torchvision_av
+    action_dim_actual: 14
+
+trainer:
+  pretrained_checkpoint: /root/data/pretrain_models/pi05_base_starvla/pi05_base_starvla/fp32/model.safetensors
+  is_resume: false
+  max_train_steps: 40000
+  num_warmup_steps: 500
+  save_interval: 5000
+  eval_interval: 100000000
+  learning_rate:
+    base: 5.0e-05
+    action_model: 2.0e-04
+    paligemma: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 1.0e-02
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-02
+  save_format: pt

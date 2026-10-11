@@ -7,7 +7,7 @@ wandb_project: robodojo_pi05
 tracker_type: swanlab
 is_debug: false
 
-# PI05 框架配置（沿用 z_umi 模板：action_dim/state pad 到 32 匹配预训练 ckpt）
+# PI05 框架配置（沿用 zerith_pi05 模板：action_dim/state pad 到 32 匹配预训练 ckpt）
 framework:
   name: PI05
   precision: bfloat16
@@ -61,7 +61,7 @@ trainer:
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
-  freeze_modules: vlm
+  freeze_modules: ''
   loss_scale:
     vla: 1.0
   max_grad_norm: 1.0

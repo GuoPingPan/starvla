@@ -29,7 +29,7 @@ import hashlib
 import io
 import json, torch
 import copy
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from pathlib import Path
 from typing import Sequence
 import os, random
@@ -38,6 +38,7 @@ import pandas as pd
 from pydantic import BaseModel, Field, ValidationError
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from starVLA.training.trainer_utils.rank_logging import tqdm_disabled  # 非 rank0 关进度条
 from PIL import Image
 import torch.distributed as dist
 
@@ -75,41 +76,65 @@ LE_ROBOT3_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 
 
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
-    """Calculate the dataset statistics of all columns for a list of parquet files."""
+    """Calculate the dataset statistics of all columns for a list of parquet files.
+
+    内存友好版 (大数据集 OOM 修复): 逐文件读取, 每列立即转成紧凑 float32 ndarray 后
+    释放 DataFrame, 只累计数值数组 —— 不再把所有文件的表 (pandas 把 list<float> 列
+    存为逐元素 numpy 对象的 object 列, 内存膨胀 ~10x) 同时留在内存再 pd.concat。
+    不可转 float 的列 (字符串/二进制) 与旧版一样被跳过, 只是更早跳过 (首文件即标记)。
+    输出与旧版逐列等价: mean/std/min/max/q01/q99。
+    """
     # Dataset statistics
-    all_low_dim_data_list = []
-    # Collect all the data
+    per_column_chunks: dict[str, list[np.ndarray]] = {}
+    unstatable: set[str] = set()
+    # Collect the data
     # parquet_paths = parquet_paths[:3]
     for parquet_path in tqdm(
         sorted(list(parquet_paths)),
         desc="Collecting all parquet files...",
+        disable=tqdm_disabled(),
     ):
         # Load the parquet file
         parquet_data = pd.read_parquet(parquet_path)
-        parquet_data = parquet_data
-        all_low_dim_data_list.append(parquet_data)
+        for le_modality in parquet_data.columns:
+            if le_modality in unstatable or "task_info" in le_modality:
+                continue
+            try:
+                col_chunks = per_column_chunks.setdefault(le_modality, [])
+                # 每文件立即转紧凑 float32; 随后 df 即可整体释放。
+                # 注意用 np.vstack 保持与旧版一致的形状语义 (标量列 -> (N,1))。
+                col_chunks.append(
+                    np.vstack(
+                        [np.asarray(x, dtype=np.float32) for x in parquet_data[le_modality]]
+                    )
+                )
+            except Exception as e:
+                print(f"Warning: Failed to process modality {le_modality} due to error: {e}")
+                unstatable.add(le_modality)
+                per_column_chunks.pop(le_modality, None)
+                continue
+        # 释放本文件表内存 (object 列膨胀是 OOM 主因)
+        del parquet_data
 
-    if not all_low_dim_data_list:
+    if not per_column_chunks:
         raise FileNotFoundError(
-            f"No parquet files found under the provided paths: {[str(p) for p in parquet_paths[:3]]}..."
+            f"No statable columns found under the provided paths: {[str(p) for p in parquet_paths[:3]]}..."
             f" — make sure the dataset has been downloaded/converted before training."
         )
 
-    all_low_dim_data = pd.concat(all_low_dim_data_list, axis=0)
     # Compute dataset statistics
     dataset_statistics = {}
-    for le_modality in tqdm(all_low_dim_data.columns, desc="Processing modalities"):
+    for le_modality in tqdm(per_column_chunks.keys(), desc="Processing modalities", disable=tqdm_disabled()):
         print(le_modality)
-        if "task_info" in le_modality:
-            continue
         print(f"Computing statistics for {le_modality}...")
         try:
-            np_data = np.vstack(
-                [np.asarray(x, dtype=np.float32) for x in all_low_dim_data[le_modality]]
-            )
+            np_data = np.vstack(per_column_chunks[le_modality])
         except Exception as e:
+            # 跨文件行宽不一致 (ragged) 等: 与旧版一致地跳过该列
             print(f"Warning: Failed to process modality {le_modality} due to error: {e}")
-            continue  
+            continue
+        finally:
+            per_column_chunks[le_modality] = None  # 释放 chunk 列表
 
         dataset_statistics[le_modality] = {
             "mean": np.mean(np_data, axis=0).tolist(),
@@ -119,6 +144,7 @@ def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
             "q01": np.quantile(np_data, 0.01, axis=0).tolist(),
             "q99": np.quantile(np_data, 0.99, axis=0).tolist(),
         }
+        del np_data  # 及时释放, 避免与下一列的 vstack 叠加
     return dataset_statistics
 
 
@@ -442,7 +468,7 @@ def calculate_delta_action_statistics(
         return output
 
     accum: dict[str, list[np.ndarray]] = {col: [] for col in action_col_slices.keys()}
-    for parquet_path in tqdm(sorted(list(parquet_paths)), desc="Collecting delta action stats"):
+    for parquet_path in tqdm(sorted(list(parquet_paths)), desc="Collecting delta action stats", disable=tqdm_disabled()):
         data = pd.read_parquet(parquet_path)
         trajectory_length = len(data)
         for action_col, slice_list in action_col_slices.items():
@@ -540,7 +566,7 @@ def calculate_rel_action_statistics(
         return output
 
     accum: dict[str, list[np.ndarray]] = {col: [] for col in action_col_slices.keys()}
-    for parquet_path in tqdm(sorted(list(parquet_paths)), desc="Collecting rel action stats"):
+    for parquet_path in tqdm(sorted(list(parquet_paths)), desc="Collecting rel action stats", disable=tqdm_disabled()):
         data = pd.read_parquet(parquet_path)
         trajectory_length = len(data)
         for action_col, slice_list in action_col_slices.items():
@@ -666,6 +692,22 @@ class LeRobotSingleDataset(Dataset):
         self.curr_traj_data = None
         self.curr_traj_id = None
 
+        # [内存] v3 parquet file 级缓存的 LRU 上限 (data_cfg.parquet_file_cache_size,
+        # 默认 0 = 不限制, 兼容小数据集如 umi)。见 get_trajectory_data_lerobot_v3。
+        self._parquet_file_cache = OrderedDict()
+        self._parquet_file_cache_max = 0
+        if data_cfg is not None:
+            try:
+                self._parquet_file_cache_max = int(data_cfg.get("parquet_file_cache_size", 0) or 0)
+            except (TypeError, ValueError):
+                self._parquet_file_cache_max = 0
+
+        # EEF-speed conditioning: per-episode speed map loaded from
+        # meta/episode_speed.json (produced offline by scripts/compute_eef_speed.py).
+        # Populated inside _get_trajectories(); empty when the file is absent,
+        # so this is a no-op for datasets without the speed annotation.
+        self.episode_speed_map = {}
+
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
@@ -673,7 +715,8 @@ class LeRobotSingleDataset(Dataset):
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
-        if int(os.environ.get("RANK", "0")) == 0:
+        # 初始化信息是常态 (mixture 每个子集一条), 静默; 聚合统计见 LeRobotMixtureDataset。
+        if int(os.environ.get("RANK", "0")) == 0 and os.environ.get("STARVLA_VERBOSE_INIT"):
             print(f"Initialized dataset {self.dataset_name} with {embodiment_tag}")
 
         # Check if the dataset is valid
@@ -761,7 +804,8 @@ class LeRobotSingleDataset(Dataset):
         ]
         n_steps_after = len(self._all_steps)
 
-        if rank == 0:
+        # 正常划分静默 (mixture 每个子集一条); 只打警告路径 (上面两个 ⚠️ 分支)。
+        if rank == 0 and os.environ.get("STARVLA_VERBOSE_INIT"):
             print(
                 f"[split] mode={self.split_mode} kept={len(self._trajectory_ids)}/{n_traj} trajs, "
                 f"{n_steps_after}/{n_steps_before} steps "
@@ -1039,6 +1083,18 @@ class LeRobotSingleDataset(Dataset):
 
     def _get_trajectories(self) -> tuple[np.ndarray, np.ndarray]:
         """Get the trajectories in the dataset."""
+        # Load EEF-speed conditioning map (offline-produced meta/episode_speed.json).
+        # Missing/corrupt file -> empty map -> speed conditioning is a no-op.
+        speed_path = self.dataset_path / "meta" / "episode_speed.json"
+        if speed_path.exists():
+            try:
+                with open(speed_path, "r") as _f:
+                    self.episode_speed_map = {
+                        int(k): v for k, v in json.load(_f).get("episodes", {}).items()
+                    }
+            except Exception as _e:
+                print(f"[speed] failed to load {speed_path}: {_e}")
+                self.episode_speed_map = {}
         # Get trajectory lengths, IDs, and whitelist from dataset metadata
         # v2.0
         if self._lerobot_version == "v2.0":
@@ -1123,51 +1179,49 @@ class LeRobotSingleDataset(Dataset):
         config_key = self._get_steps_config_key()
         steps_filename = "steps_data_index.pkl"
         steps_path = self.dataset_path / "meta" / steps_filename
-    
-        # ---------- try to read from cache  ----------
-        if steps_path.exists():
+
+        # ---------- flock 互斥的 read-or-build ----------
+        # 原实现: 缓存命中提前 return (跳过 barrier) + rank0 建 + 其余 barrier 等待。
+        # bug: 外部进程 (如 precompute) 写入时机夹在 ranks 的 exists() 检查之间时,
+        # 各 rank 走不同路径 → dist.barrier 计数错位 → 有人读到未写完的文件
+        # (H1 训练启动实录: FileNotFoundError steps_data_index.pkl)。
+        # flock 方案对所有进程 (8 ranks + 预计算) 统一: 拿锁 → 有缓存读缓存,
+        # 没缓存就建 (锁保证单写者), 无 barrier 对齐假设。
+        import fcntl
+
+        lock_path = steps_path.with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
             try:
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
-            except Exception as e:
-                # include EOFError / PickleError / KeyError
-                print(
-                    f"[RANK {os.environ.get('RANK', 'NA')}] "
-                    f"Failed to load cached steps ({e}), will rebuild."
-                )
-    
-        # ---------- only build by rank0  ----------
-        if is_main():
-            all_steps = self._get_all_steps_single_process()
-    
-            cache_data = {
-                "config_key": config_key,
-                "steps": all_steps,
-                "num_trajectories": len(self.trajectory_ids),
-                "total_steps": len(all_steps),
-                "computed_timestamp": pd.Timestamp.now().isoformat(),
-                "delete_pause_frame": self.delete_pause_frame,
-            }
-    
-            steps_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = steps_path.with_suffix(".tmp")
-    
-            with open(tmp_path, "wb") as f:
-                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp_path, steps_path)
-    
-            print(f"[RANK 0] Cached steps saved to {steps_path}")
-    
-        # ---------- sync after rank0  ----------
-        if dist.is_initialized():
-            dist.barrier()
-    
-        # ---------- read by all rank ----------
-        with open(steps_path, "rb") as f:
-            cached_data = pickle.load(f)
-    
-        return cached_data["steps"]
+                if steps_path.exists():
+                    try:
+                        with open(steps_path, "rb") as f:
+                            cached_data = pickle.load(f)
+                        return cached_data["steps"]
+                    except Exception as e:
+                        print(
+                            f"[RANK {os.environ.get('RANK', 'NA')}] "
+                            f"Failed to load cached steps ({e}), will rebuild."
+                        )
+
+                all_steps = self._get_all_steps_single_process()
+                cache_data = {
+                    "config_key": config_key,
+                    "steps": all_steps,
+                    "num_trajectories": len(self.trajectory_ids),
+                    "total_steps": len(all_steps),
+                    "computed_timestamp": pd.Timestamp.now().isoformat(),
+                    "delete_pause_frame": self.delete_pause_frame,
+                }
+                tmp_path = steps_path.with_suffix(".tmp")
+                with open(tmp_path, "wb") as f:
+                    pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp_path, steps_path)
+                print(f"[RANK {os.environ.get('RANK', 'NA')}] Cached steps saved to {steps_path}")
+                return all_steps
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
 
     def _get_steps_config_key(self) -> str:
         """Generate a configuration key for steps caching."""
@@ -1189,7 +1243,7 @@ class LeRobotSingleDataset(Dataset):
         # Check if language modality is configured
         has_language_modality = 'language' in self.modality_keys and len(self.modality_keys['language']) > 0
         # TODO why trajectory_length here, why not use data length?
-        for trajectory_id, trajectory_length in tqdm(zip(self.trajectory_ids, self.trajectory_lengths), total=len(self.trajectory_ids), desc="Getting All Step"):
+        for trajectory_id, trajectory_length in tqdm(zip(self.trajectory_ids, self.trajectory_lengths), total=len(self.trajectory_ids), desc="Getting All Step", disable=tqdm_disabled()):
             try:
                 if self._lerobot_version == "v2.0":
                     data = self.get_trajectory_data(trajectory_id)
@@ -1515,7 +1569,17 @@ class LeRobotSingleDataset(Dataset):
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
         sample = self._pack_sample(data)
-        return self._finalize_sample(sample, trajectory_id, base_index)
+        sample = self._finalize_sample(sample, trajectory_id, base_index)
+        # 数据溯源 (grad norm 异常审计用, 见 train_starvla 的 sample_audit): 轻量
+        # 身份字段随样本透传, 框架层不消费。字段缺失时审计端自动跳过。
+        sample["provenance"] = {
+            "dataset": getattr(self, "dataset_name", ""),
+            "episode": int(trajectory_id),
+            "step": int(base_index),
+            "task": str(sample.get("lang", "")),
+            "robot_tag": str(sample.get("robot_tag", "")),
+        }
+        return sample
 
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
@@ -1556,6 +1620,52 @@ class LeRobotSingleDataset(Dataset):
 
         return sample
 
+    def _get_speed_token(self, trajectory_id, base_index=0) -> str:
+        """Build the EEF-speed conditioning token for an episode.
+
+        Reads speed config from ``self.data_cfg``:
+        - ``speed_conditioning`` (bool, default False): master toggle.
+        - ``speed_prompt_format`` ("bin" | "raw", default "bin"): token value.
+        - ``speed_dropout_prob`` (float, default 0.15): probability to drop the
+          whole token to learn an unconditional branch (CFG), training split only.
+
+        Returns "" when disabled, when no speed is recorded for the episode, or
+        when dropout triggers.
+        """
+        cfg = self.data_cfg or {}
+        if not cfg.get("speed_conditioning", False):
+            return ""
+        entry = self.episode_speed_map.get(int(trajectory_id))
+        if not entry:
+            return ""
+        fmt = cfg.get("speed_prompt_format", "bin")
+        value = entry.get(fmt)
+        if value is None:
+            return ""
+        if self.split_mode == "train":
+            if self._speed_dropout_rng(trajectory_id, base_index).random() < float(cfg.get("speed_dropout_prob", 0.15)):
+                return ""
+        if fmt == "raw":
+            value = f"{float(value):.4f}"
+        else:
+            value = str(int(value))
+        return f"<speed:{value}>"
+
+    def _speed_dropout_rng(self, trajectory_id, base_index):
+        """speed token 的 per-item 确定性 RNG。
+
+        以前用全局 `random.random()` (worker 进程流): 同一 item 在 resume 后
+        (worker 重启) 会得到不同的 dropout 判定, 破坏数值零偏差 resume。改为
+        (epoch, trajectory, base_index) 播种 —— item 内容成为纯确定函数。
+        """
+        from random import Random
+
+        return Random(
+            safe_hash(
+                ("speed_dropout", getattr(self, "split_mode", ""), getattr(self, "epoch", 0), int(trajectory_id), int(base_index))
+            )
+        )
+
     def _finalize_sample(self, sample: dict, trajectory_id, base_index) -> dict:
         """Hook for subclasses to attach per-sample fields that need trajectory
         context (e.g. ``action_pad``).
@@ -1563,8 +1673,11 @@ class LeRobotSingleDataset(Dataset):
         Called by BOTH ``LeRobotSingleDataset.__getitem__`` and
         ``LeRobotMixtureDataset.__getitem__`` (the real training path wraps
         every dataset in a mixture), so overrides here take effect regardless
-        of which entry point is used. Default is a no-op.
+        of which entry point is used. Default injects the EEF-speed token.
         """
+        speed_token = self._get_speed_token(trajectory_id, base_index)
+        if speed_token:
+            sample["lang"] = f"{sample['lang']} {speed_token}"
         return sample
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
@@ -1635,7 +1748,21 @@ class LeRobotSingleDataset(Dataset):
                 chunk_index=chunk_index, file_index=file_index
             )
             assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            file_data = pd.read_parquet(parquet_path)
+            # [perf] file 级缓存: lerobot v3 一个 parquet file 含多 episode(~100MB),
+            # 每轨迹都 read_parquet 整个 file 会让同一文件被读上千次(网络盘灾难)。
+            # 读一次缓存到内存, 每轨迹从 df 过滤 episode。
+            # [内存] LRU 上限 parquet_file_cache_size (data_cfg, 默认 0=不限制, 兼容小数据集):
+            # 大数据集 (几十 GB parquet, pandas object 列膨胀 ~10x) 不设限会把整个
+            # mixture 的所有文件常驻内存 → memcg OOM。按文件数 LRU 驱逐。
+            if not hasattr(self, "_parquet_file_cache"):
+                self._parquet_file_cache = OrderedDict()
+            if parquet_path not in self._parquet_file_cache:
+                self._parquet_file_cache[parquet_path] = pd.read_parquet(parquet_path)
+                while self._parquet_file_cache_max and len(self._parquet_file_cache) > self._parquet_file_cache_max:
+                    self._parquet_file_cache.popitem(last=False)
+            else:
+                self._parquet_file_cache.move_to_end(parquet_path)
+            file_data = self._parquet_file_cache[parquet_path]
             
             # filter by trajectory_id
             episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
@@ -1841,12 +1968,80 @@ class LeRobotSingleDataset(Dataset):
             from_timestamp = float(from_timestamps.get(original_video_key, 0.0))
             video_timestamp = video_timestamp + from_timestamp
 
-        return get_frames_by_timestamps(
-            video_path.as_posix(),
-            video_timestamp,
-            video_backend=self.video_backend, # TODO
-            video_backend_kwargs=self.video_backend_kwargs,
-        )
+        try:
+            return get_frames_by_timestamps(
+                video_path.as_posix(),
+                video_timestamp,
+                video_backend=self.video_backend,
+                video_backend_kwargs=self.video_backend_kwargs,
+            )
+        except Exception as exc:
+            # eval 可能切到 decord 提速;个别数据集 decord 读不了 → 粘性回退 torchvision_av
+            # (慢但正确),避免逐帧重试 + 警告刷屏。已是 torchvision_av 则直接抛。
+            if self.video_backend == "torchvision_av":
+                raise
+            if not getattr(self, "_video_backend_fell_back", False):
+                self._video_backend_fell_back = True
+                print(
+                    f"[get_video] backend={self.video_backend} 读 {video_path.name} 失败 "
+                    f"({exc!r}); 本数据集粘性回退 torchvision_av(eval 会慢,但正确)。"
+                    f"如需禁用 eval 的 decord 优选: 设 eval.video_backend: torchvision_av。"
+                )
+            self.video_backend = "torchvision_av"
+            self.video_backend_kwargs = {}
+            # 清掉可能用 decord 预载的 reader 缓存,避免后端不一致(torchvision_av 分支不认 'vr' 键)
+            from . import video as _video_mod
+
+            _video_mod.clear_video_cache()
+            return get_frames_by_timestamps(
+                video_path.as_posix(),
+                video_timestamp,
+                video_backend="torchvision_av",
+                video_backend_kwargs={},
+            )
+
+    def preload_video_cache(self, trajectory_id: int, video_keys: list[str] | None = None) -> None:
+        """一次性把该轨迹所有相机的视频帧解码进内存(video.py 全局缓存),供 eval 循环内零 I/O 取帧。
+
+        仅对存在视频文件(非 parquet 内嵌图)的相机生效;同一轨迹重复调用是 no-op。
+        episode_id == trajectory_id(eval_starvla 里二者同义)。
+        """
+        from . import video as _video_mod
+
+        if video_keys is None:
+            video_keys = list(self.modality_keys.get("video", []))
+        loaded = list(getattr(self, "_loaded_video_paths", []))
+        for key in video_keys:
+            strip_key = key[len("video.") :] if key.startswith("video.") else key
+            try:
+                path = self.get_video_path(trajectory_id, strip_key)
+            except Exception:
+                continue
+            if path.exists():
+                pos = path.as_posix()
+                try:
+                    _video_mod.preload_video_cache(
+                        pos,
+                        video_backend=self.video_backend,
+                        video_backend_kwargs=self.video_backend_kwargs,
+                    )
+                    if pos not in loaded:
+                        loaded.append(pos)
+                except Exception as exc:  # noqa: BLE001 — 缓存是优化,任何失败都不阻断 eval
+                    print(
+                        f"[preload_video_cache] 跳过 {pos} (backend={self.video_backend}): "
+                        f"{exc!r}; eval 将回退到逐次解码(较慢但不影响正确性)"
+                    )
+        self._loaded_video_paths = loaded
+
+    def release_video_cache(self, trajectory_id: int | None = None) -> None:
+        """释放本 dataset 预加载的视频帧缓存(traj_id 仅作日志用,实际按已加载路径清)。"""
+        from . import video as _video_mod
+
+        paths = getattr(self, "_loaded_video_paths", None)
+        if paths:
+            _video_mod.clear_video_cache(paths)
+            self._loaded_video_paths = []
 
     def get_state_or_action(
         self,
@@ -2115,6 +2310,7 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
                 zip(self.trajectory_ids, self.trajectory_lengths),
                 total=len(self.trajectory_ids),
                 desc=f"Caching {key} frames",
+                disable=tqdm_disabled(),
             ):
                 video_path = self.get_video_path(trajectory_id, key)
                 frames = get_all_frames(
@@ -2373,7 +2569,15 @@ class LeRobotMixtureDataset(Dataset):
 
         # 1. Dataset lengths
         self._dataset_lengths = np.array([len(dataset) for dataset in self.datasets])
-        print(f"Dataset lengths: {self._dataset_lengths}")
+        # 静默; 换成聚合一行 (需要细节时 STARVLA_VERBOSE_INIT=1)
+        _rank = int(os.environ.get("RANK", "0"))
+        if _rank == 0:
+            print(
+                f"[mixture] {len(self.datasets)} datasets, "
+                f"{int(self._dataset_lengths.sum())} steps total"
+                + (f", lengths={self._dataset_lengths.tolist()}" if os.environ.get("STARVLA_VERBOSE_INIT") else ""),
+                flush=True,
+            )
         self._getitem_count = 0
         # 2. Dataset sampling weights
         self._dataset_sampling_weights = np.array(dataset_sampling_weights)
@@ -2537,6 +2741,10 @@ class LeRobotMixtureDataset(Dataset):
         if self._getitem_count % 1000 == 0:
             gc.collect()
 
+        # 重试重采样也按 (epoch, index) 播种: 健康流不走到这里, 但一旦走到
+        # (视频缺失/坏样本), 流内容仍是确定函数, 不破坏 resume 数值对齐。
+        item_rng = random.Random(safe_hash(("mixture_retry", getattr(self, "epoch", 0), index, self.seed)))
+
         max_retries = 10
         last_exception = None
 
@@ -2563,12 +2771,20 @@ class LeRobotMixtureDataset(Dataset):
                     video_path = dataset.get_video_path(trajectory_id, key)
                     if os.path.exists(video_path):
                         break
-                    index = random.randint(0, len(self) - 1)
+                    index = item_rng.randint(0, len(self) - 1)
                     
-                raw_data = dataset.get_step_data(trajectory_id, step)    
+                raw_data = dataset.get_step_data(trajectory_id, step)
                 data = dataset.transforms(raw_data)
                 sample = dataset._pack_sample(data)
                 sample = dataset._finalize_sample(sample, trajectory_id, step)
+                # 数据溯源 (同 single 路径): mixture 下 dataset 来自采样, 必须逐样本记录
+                sample["provenance"] = {
+                    "dataset": getattr(dataset, "dataset_name", ""),
+                    "episode": int(trajectory_id),
+                    "step": int(step),
+                    "task": str(sample.get("lang", "")),
+                    "robot_tag": str(sample.get("robot_tag", "")),
+                }
                 
                 return sample
                 
@@ -2580,7 +2796,7 @@ class LeRobotMixtureDataset(Dataset):
                     print(f"Retrying with new sample...")
                     # For retry, we can use a slightly different index to get a new sample
                     # This helps avoid getting stuck on the same problematic sample
-                    index = random.randint(0, len(self) - 1)
+                    index = item_rng.randint(0, len(self) - 1)
                 else:
                     # All retries exhausted
                     print(f"All {max_retries} attempts failed for index {index}")
@@ -2866,11 +3082,27 @@ class LeRobotMixtureDataset(Dataset):
                 modality_configs[modality].add(json.dumps(configs))
         merged_metadata["modalities"] = {}
         for modality, configs in modality_configs.items():
-            # Check that all modality configs correspond to the same tag matches
-            assert (
-                len(configs) == 1
-            ), f"Multiple modality configs for modality {modality}: {list(configs)}"
-            merged_metadata["modalities"][modality] = json.loads(configs.pop())
+            if len(configs) == 1:
+                merged_metadata["modalities"][modality] = json.loads(configs.pop())
+                continue
+            # Configs differ across datasets.
+            # For the video modality this is expected: raw resolutions vary across
+            # sub-datasets, but the transform pipeline (VideoCenterCrop + VideoResize)
+            # reads the true frame size at runtime and resizes to a fixed target, so
+            # the stored resolution is cosmetic. Pick the first config and warn.
+            # For state/action a mismatch means genuinely incompatible dims -> still error.
+            if modality == "video":
+                print(
+                    f"[mixture] video modality has {len(configs)} differing configs "
+                    f"(resolutions); center-crop+resize adapt at runtime. "
+                    f"Using representative: {json.loads(next(iter(configs)))}"
+                )
+                merged_metadata["modalities"][modality] = json.loads(next(iter(configs)))
+            else:
+                assert False, (
+                    f"Multiple incompatible modality configs for modality {modality}: "
+                    f"{[json.loads(c) for c in configs]}"
+                )
 
         return DatasetMetadata.model_validate(merged_metadata)
 

@@ -1,0 +1,107 @@
+
+# ============================================================================
+# DEBUG 配置: 静态复读数据 (剥离 dataloader, 纯测模型侧训练)
+# ----------------------------------------------------------------------------
+# 原理: 启动时预取 static_repeat_batches 个 batch 缓存在内存, 之后无限复读。
+#   - timing/data 恒 ≈ 0 (设计行为)
+#   - timing/model 此时 = GPU 进程内 CPU 预处理 (A 类) + 纯 GPU 计算 (B 类)
+#   - 与正常训练的耗时差 = 数据管线 (C 类) + 多卡 straggler 贡献
+#
+# 用法:
+#   NUM_GPUS=1 BATCH=6 STARVLA_PROFILE=1 STARVLA_PROFILE_SKIP=10 \
+#   STARVLA_PROFILE_STEPS=10 STARVLA_PROFILE_GAP=1 \
+#   bash examples/realRobots/zerith_pi05/train_files/run_umi_pi05_relative_6d.sh \
+#        examples/realRobots/zerith_pi05/train_files/debug_static_data.yaml
+#
+# 对照实验建议 (每次只动一个变量):
+#   1. 本配置 (eager, 无 compile)          → model_time 基线
+#   2. + STARVLA_USE_SDPA=1                → B3 attention 后端收益
+#   3. + STARVLA_COMPILE=default           → B4 算子融合收益
+#   4. 正常 yaml (同 batch/开关)           → 差值 = C 类数据管线
+#
+# 注意: 同一批数据无限复读, loss 会在几个 batch 间震荡 —— 只看耗时/NaN,
+#       不看收敛。对复现 NaN 反而有利 (输入确定)。
+# ============================================================================
+
+run_id: debug_static_eps
+run_root_dir: /nix/data/model_outputs
+seed: 42
+wandb_entity: zumi_test
+wandb_project: umi_relative_6d_pi05
+tracker_type: swanlab
+is_debug: false
+
+# PI05 框架配置 (与 umi_all_nohjerk_noproblem_smooth_oss.yaml 保持一致)
+framework:
+  name: PI05
+  precision: bfloat16
+  action_dim: 32
+  action_horizon: 50
+  max_state_dim: 32
+  discrete_state_input: false
+  max_token_len: 200
+  num_inference_steps: 10
+  tokenizer:
+    model_path: /root/data/pretrain_models/paligemma-3b-pt-224/tokenizer.model
+    pad_state_value: -2.0
+  paligemma:
+    model_name_or_path: ""
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: false
+    data_root_dir: /root/data/z-umi/data
+    data_mix: umi_all_nohjerk_noproblem_smooth_oss
+    action_type: delta_ee
+    action_mode: abs
+    per_device_batch_size: 4          # 被 launcher 的 BATCH 覆盖
+    num_workers: 4                    # 仅预取阶段用到, 复读期 worker 已关停
+    prefetch_factor: 2
+    persistent_workers: true
+    pin_memory: true
+    load_all_data_for_training: true
+    lerobot_version: v3.0
+    video_backend: torchvision_av
+    action_dim_actual: 10
+    # ── 调试开关: 静态复读 (也可以不改 yaml, 直接 STARVLA_STATIC_DATA=1) ──
+    static_repeat: true
+    static_repeat_batches: 8          # 预取 batch 数; env STARVLA_STATIC_BATCHES 可覆盖
+    split:
+      enabled: true
+      train_percent: 90
+    speed_conditioning: true
+    speed_prompt_format: raw
+    speed_num_bins: 10
+    speed_dropout_prob: 0.15
+
+trainer:
+  pretrained_checkpoint: /root/data/pretrain_models/pi05_base_starvla/pi05_base_starvla/fp32/model.safetensors
+  is_resume: false
+  max_train_steps: 60                 # 短跑 debug; launcher MAX_STEPS 可覆盖
+  num_warmup_steps: 1000
+  save_interval: 1000000              # debug 不存中间 ckpt
+  # 关闭内联 eval: 它会拉真实 eval batch + 跑 10 步 flow matching,
+  # 混入 model_time 会污染测量。
+  eval_interval: 100000000
+  learning_rate:
+    base: 5.0e-05
+    action_model: 2.0e-04
+    paligemma: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 1.0e-02
+  logging_frequency: 1                # 每步都打 timing
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-06
+    weight_decay: 1.0e-02
+  save_format: pt

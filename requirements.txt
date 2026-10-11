@@ -1,7 +1,6 @@
 transformers==4.57.0
 accelerate==1.5.2
 tiktoken
-sentencepiece
 einops
 transformers_stream_generator==0.0.4
 scipy

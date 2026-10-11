@@ -1,0 +1,106 @@
+run_id: starvla_h1_ddl_d18480a6_qwenpi_v3
+run_root_dir: /root/data/model_outputs
+seed: 42
+wandb_entity: ""
+wandb_project: h1_ddl_d18480a6_qwenpi_v3
+tracker_type: swanlab
+is_debug: false
+
+# H1 training configuration for the repository's QwenPI_v3 implementation.
+# H1 action/state layout:
+#   7 + 7 end-effector poses, 7 + 7 arm joints, 1 + 1 grippers = 30D.
+framework:
+  name: QwenPI_v3
+  precision: bfloat16
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3.5-0.8B  # 修复: 原路径不存在
+    # flash_attention_2: 视觉注意力走 cu_seqlens 变长内核 (sdpa 路径是逐图 python
+    # 循环, 144 图/步占主线程 ~22%, py-spy 实测)。wheel 在 /mnt/cfs/code/wheels/。
+    attn_implementation: flash_attention_2
+    gradient_checkpointing: true     # 显存换 batch
+    # H1 task strings are longer than the compact UMI reference strings.
+    pad_seq_len: 384  # 修复: 实测含state序列 357 token (3视图×64 + 文本), 256 会越界
+    tok_cache: auto  # memo 运行时回填 + finalize 落盘 precompute/tok_cache_qwen35.parquet, 重启直读
+    # 逐层编译 24 个 decoder layers + hook 捕获层输出 (调优实测 +6% 吞吐,
+    # 含 ~2min 编译预热; 数值与 eager 有 bf16 融合级微差)。调试可用
+    # STARVLA_COMPILE 环境变量覆盖。
+    torch_compile: true
+    vision_preprocess:
+      transforms:
+        - {op: resize, size: 256, interpolation: bicubic, antialias: true}
+        - {op: normalize, mean: [0.5, 0.5, 0.5], std: [0.5, 0.5, 0.5]}
+      encoder: {patch_size: 16, merge_size: 2, temporal_patch_size: 2}
+  action_model:
+    action_model_type: LayerwiseFM
+    action_dim: 30
+    state_dim: 30
+    action_horizon: 50
+    repeated_diffusion_steps: 1
+    gradient_checkpointing: true    # DiT 重计算
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    max_seq_len: 1024
+    add_pos_embed: true
+    diffusion_model_cfg:
+      # Qwen3.5-0.8B hidden size is resolved at runtime; this is the
+      # action DiT internal width used by the QwenPI_v3 reference recipe.
+      action_dit_hidden_dim: 1024
+      attention_head_dim: 64
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /root/data/h1_ddl_d18480a6
+    data_mix: h1_ddl_d18480a6
+    action_type: delta_ee
+    action_mode: abs
+    action_dim_actual: 30
+    per_device_batch_size: 48  # 调优定版: bs64 显存爆 (74+11GB>80GB), bs48+gc.freeze+编译 = +68% 吞吐
+    num_workers: 8
+    prefetch_factor: 4
+    persistent_workers: true
+    pin_memory: true
+    load_all_data_for_training: true
+    lerobot_version: v3.0
+    video_backend: torchvision_av
+    split:
+      enabled: true
+      train_percent: 90
+
+trainer:
+  # Qwen3.5 is loaded from base_vlm; no PI05 checkpoint is compatible here.
+  pretrained_checkpoint: ""
+  is_resume: false
+  max_train_steps: 20000
+  num_warmup_steps: 1000
+  save_interval: 2000
+  eval_interval: 0
+  # warmup 后 gc.freeze() 消 bwd GC 长尾 (调优实测 -24% 步时且方差消失, 默认即开;
+  # 排查问题可 STARVLA_GC_FREEZE=0 临时关闭)。
+  gc_freeze: true
+  learning_rate:
+    base: 5.0e-05
+    qwen_vl_interface: 5.0e-05
+    action_model: 2.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ""
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-02
+  save_format: pt

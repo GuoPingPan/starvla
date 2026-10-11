@@ -26,7 +26,9 @@ from .concat import ConcatTransform
 #     StateActionToTensor,
 #     StateActionTransform,
 # )
+# --- ZERITH PATCH P019: re-export VideoCenterCrop (配合 video.py 的 CenterCrop pipeline, 修 commit 96c987c 遗漏的 __init__ 导出; 见 upstream_patches.md) ---
 from .video import (
+    VideoCenterCrop,
     VideoColorJitter,
     VideoCrop,
     VideoGrayscale,
@@ -38,30 +40,4 @@ from .video import (
     VideoToNumpy,
     VideoToTensor,
     VideoTransform,
-)
-
-# New 6D rotation and relative control transforms
-from .pose_rotation import (
-    PoseRotationTransform,
-    EulerPoseToQuaternionTransform,
-)
-from .quaternion_to_6d import QuaternionTo6DRotation
-from .relative_pose import (
-    RelativePoseTransform,
-    RelativeJointTransform,
-)
-
-# New normalization module (statistics computation functions)
-from .normalization import (
-    compute_stats_from_dataset,
-    save_statistics,
-    load_statistics,
-)
-
-# Normalization classes (from state_action.py)
-from .state_action import (
-    Normalizer,
-    NormalizationTransform,
-    StateActionTransform,
-    StateActionToTensor,
 )

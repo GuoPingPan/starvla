@@ -297,8 +297,8 @@ class PI0(baseframework):
         self._build_tokenizer()
         self._build_model_modules()
         self.to_precision(self.config.framework.precision)
-        # 允许 bf16 matmul 使用 TF32 (在 Ampere+ 上更快,精度足够)。
-        torch.set_float32_matmul_precision("highest")
+        # fp32 matmul 走 TF32 (在 Ampere+ 上更快,精度足够)。原值 "highest" 实为关掉 TF32(注释与代码相反)。
+        torch.set_float32_matmul_precision("high")
         self._maybe_compile_hotpath()
 
     def _init_runtime_config(self, config):
@@ -361,13 +361,25 @@ class PI0(baseframework):
         embed_prefix 视觉编码), 避开 framework.forward 里的 PIL/numpy 数据预处理 ——
         否则 dynamo 会撞 read-only numpy 的 'cannot set WRITEABLE flag' bug 而崩。
 
-        env STARVLA_COMPILE: 空/0/off → 关; default/1 → mode=default; reduce-overhead /
-        max-autotune → 对应模式 (reduce-overhead 走 CUDA graphs, 需静态 shape, 慎用)。
+        配置来源: env STARVLA_COMPILE 优先; 未设 env 时读 yaml framework.compile
+        (default / reduce-overhead / max-autotune / max-autotune-no-cudagraphs; 空=关)。
+        值: 空/0/off/false/no → 关; default/1/true → mode=default;
+        max-autotune → Triton 调优 + CUDA Graphs (⚠️ dynamic shape 下 capture 会挂死,
+        实测单卡亦卡; 8 卡另有各 rank 独立调优 + NCCL 互等死锁, 勿用);
+        max-autotune-no-cudagraphs → 仅 Triton 调优, 无录图, 配合 COMPILE_WARMUP=1
+        (train.sh 段4.5) + 共享编译缓存可在多卡安全使用;
+        reduce-overhead → CUDA Graphs 模式, 需静态 shape, 慎用。
         """
         raw = os.environ.get("STARVLA_COMPILE", "").strip().lower()
+        if not raw:
+            raw = str(getattr(getattr(self.config, "framework", None), "compile", "") or "").strip().lower()
         if raw in ("", "0", "off", "false", "no"):
             return
-        mode = raw if raw in ("default", "reduce-overhead", "max-autotune") else "default"
+        mode = (
+            raw
+            if raw in ("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs")
+            else "default"
+        )
         kw = {"mode": mode}
         if mode != "reduce-overhead":
             kw["dynamic"] = True  # 序列长度可能逐 batch 变, 动态 shape 避免反复重编译
@@ -459,12 +471,23 @@ class PI0(baseframework):
         """
         images, masks, states, actions, prompts = [], [], [], [], []
         action_pad_list = []
+        # STARVLA_COLLATE_TENSORS=1 时 worker 已把 PIL 转成 CHW float [-1,1] 张量,
+        # 这里直接消费 (跳过 PIL→numpy→归一化的主进程 CPU 段, 免受 worker 解码抢占)。
+        precollated = bool(
+            examples
+            and isinstance(examples[0].get("image"), (list, tuple))
+            and len(examples[0]["image"]) > 0
+            and isinstance(examples[0]["image"][0], torch.Tensor)
+        )
         for example in examples:
-            raw_images = to_pil_preserve(example["image"])
-            if isinstance(raw_images, tuple):
-                raw_images = list(raw_images)
-            elif not isinstance(raw_images, list):
-                raw_images = [raw_images]
+            if precollated:
+                raw_images = list(example["image"])
+            else:
+                raw_images = to_pil_preserve(example["image"])
+                if isinstance(raw_images, tuple):
+                    raw_images = list(raw_images)
+                elif not isinstance(raw_images, list):
+                    raw_images = [raw_images]
             sample_images, sample_masks = [], []
             provided_mask = example.get("image_mask")
             provided_mask = list(provided_mask) if provided_mask is not None else None
@@ -474,10 +497,16 @@ class PI0(baseframework):
                     image = raw_images[idx]
                 else:
                     # 缺失视角:用第一张图的拷贝涂黑,attention 会通过 mask 忽略。
-                    image = raw_images[0].copy()
-                    image.paste(0, (0, 0, image.size[0], image.size[1]))
+                    if precollated:
+                        image = torch.zeros_like(raw_images[0])
+                    else:
+                        image = raw_images[0].copy()
+                        image.paste(0, (0, 0, image.size[0], image.size[1]))
                 active = bool(provided_mask[idx]) if provided_mask is not None and idx < len(provided_mask) else has_image
-                sample_images.append(self._pil_to_tensor(image))
+                if precollated and isinstance(image, torch.Tensor):
+                    sample_images.append(image)
+                else:
+                    sample_images.append(self._pil_to_tensor(image))
                 sample_masks.append(active)
             images.append(torch.stack(sample_images))
             masks.append(sample_masks)

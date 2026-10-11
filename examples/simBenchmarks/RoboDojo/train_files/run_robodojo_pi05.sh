@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RoboDojo · PI05 训练启动脚本（适配自 z_umi，单卡 A100）。
+# RoboDojo · PI05 训练启动脚本（适配自 zerith_pi05，单卡 A100）。
 #
 # 用法:
 #   bash examples/simBenchmarks/RoboDojo/train_files/run_robodojo_pi05.sh [config.yaml] [run_tag]

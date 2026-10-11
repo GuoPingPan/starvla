@@ -9,6 +9,7 @@ Utility class for creating a centralized/standardized logger (built on Rich) and
 import logging
 import logging.config
 import os
+import sys
 from contextlib import nullcontext
 from logging import LoggerAdapter
 from typing import Any, Callable, ClassVar, Dict, MutableMapping, Tuple, Union
@@ -34,6 +35,31 @@ LOG_CONFIG = {
     },
     "root": {"level": "INFO", "handlers": ["console"]},
 }
+
+# === 云端/管道日志可读性:消除 Rich 两种宽度相关噪声 ===
+# RichHandler 底层 LogRender 把日志渲染成 Table.grid 且硬编码 Table.expand=True,表格总会撑满 console 宽度:
+#   · 宽度小(非 TTY 默认 80)→ 消息列 overflow="fold",长日志被折成多行,再被 K8s 采集器按 \n 拆碎;
+#   · 宽度大 → 表格填充到该宽度,每行大多是空格(“大部分为空”)。
+# 修法两步,缺一不可:
+#   (1) 非 TTY 下把 COLUMNS 设大 → 长日志不再 fold(必须先于 dictConfig,Rich 构造 Console 时读 COLUMNS);
+#   (2) 把 LogRender 返回的 Table.expand 置 False → 表格只占内容宽度,不再填充空格
+#       (expand 在渲染时才读取,故在 __call__ 返回后翻转仍生效)。
+if not sys.stdout.isatty() and "COLUMNS" not in os.environ:
+    os.environ["COLUMNS"] = "4096"
+
+import rich._log_render as _rich_log_render  # noqa: E402  (须在 COLUMNS 设置之后、dictConfig 之前)
+
+_orig_log_render_call = _rich_log_render.LogRender.__call__
+
+
+def _log_render_no_expand(self, *args, **kwargs):
+    _table = _orig_log_render_call(self, *args, **kwargs)
+    _table.expand = False
+    return _table
+
+
+_rich_log_render.LogRender.__call__ = _log_render_no_expand
+
 logging.config.dictConfig(LOG_CONFIG)
 
 

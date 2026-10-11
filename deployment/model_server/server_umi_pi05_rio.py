@@ -35,7 +35,7 @@ dict 进 dict 出: 收 ``{video, language, state}``, 返回**绝对** action dic
   PYTHONPATH=/home/zerith/ws/orion/starvla \
   /home/zerith/miniforge3/envs/starVLA/bin/python -m deployment.model_server.server_umi_pi05_rio serve \
       --checkpoint /home/zerith/.models/run_umi_shenzhen_relative_6d_20000step_0727_100151 \
-      --deploy-yaml examples/realRobots/z_umi/deploy_files/deploy_umi_pi05_relative_6d.yaml
+      --deploy-yaml examples/realRobots/zerith_pi05/deploy_files/deploy_umi_pi05_relative_6d.yaml
 
   # 不用 deploy-yaml 时, 各 flag 仍可直接给 (CLI > deploy-yaml > ckpt > 默认); tokenizer
   # 路径缺失时 export STARVLA_PALIGEMMA_TOKENIZER=<本地路径> 兜底。
@@ -87,6 +87,22 @@ def merge_deploy_overlay(ckpt_cfg: dict, deploy_yaml: Path | None):
     return OmegaConf.merge(base, overlay)
 
 
+def _local_file_exists(path: str | None) -> bool:
+    """``Path.is_file()`` 的"本机可读"版本: ``PermissionError``/``OSError`` 一律当 False。
+
+    为什么不直接用 ``Path.is_file()``: 它对**路径不存在**返回 False (ENOENT 被吞), 但对
+    **路径存在却无权访问** (如训练机 bake 死的 ``/root/data/...``, ``/root`` 是 mode 700)
+    会上抛 ``PermissionError`` (EACCES)。这会让 ``build_tokenizer_override`` 在算出
+    override **之前**就崩, 本地 tokenizer 副本永远用不上。这里降级为 False 即可走 override。
+    """
+    if not path:
+        return False
+    try:
+        return Path(str(path)).is_file()
+    except (PermissionError, OSError):
+        return False
+
+
 def resolve_tokenizer_path(merged_cfg) -> str:
     """从 merged config 取 ``framework.tokenizer.model_path``: 文件存在就用; 否则回退 env;
     都没有则抛带可操作提示的 FileNotFoundError。
@@ -96,10 +112,10 @@ def resolve_tokenizer_path(merged_cfg) -> str:
     from omegaconf import OmegaConf
 
     configured = OmegaConf.select(merged_cfg, "framework.tokenizer.model_path", default=None)
-    if configured and Path(str(configured)).is_file():
+    if _local_file_exists(configured):
         return str(configured)
     env_path = os.environ.get("STARVLA_PALIGEMMA_TOKENIZER")
-    if env_path and Path(env_path).is_file():
+    if _local_file_exists(env_path):
         print(
             f"[load] framework.tokenizer.model_path={configured!r} 本机缺失, "
             f"回退 env STARVLA_PALIGEMMA_TOKENIZER={env_path}",
@@ -120,7 +136,7 @@ def build_tokenizer_override(merged_cfg, ckpt_cfg: dict) -> list[str]:
     请写进 deploy-yaml 的 ``framework.*`` 段 (OmegaConf.merge 即生效, 无需 CLI)。
     """
     ckpt_tok = (ckpt_cfg.get("framework", {}) or {}).get("tokenizer", {}).get("model_path")
-    if ckpt_tok and Path(str(ckpt_tok)).is_file():
+    if _local_file_exists(ckpt_tok):
         return []  # ckpt 原路径本机就有, from_pretrained 直接能用
     eff = resolve_tokenizer_path(merged_cfg)
     print(f"[load] ckpt tokenizer {ckpt_tok!r} 本机缺失 → override -> {eff}", flush=True)
@@ -406,7 +422,10 @@ class StarVlaZenohServer:
         """共用的解包 / 协议校验 / 错误封装 / 回复。"""
         with query:
             try:
-                envelope = _unpack(query.payload.to_bytes())
+                # zenoh >= 1.10: payload-less GET 的 query.payload 是 None (老版本是空 ZBytes)。
+                # 无 payload 的探测 (如裸 health probe) 走协议错误回复, 而不是 AttributeError 崩掉回调。
+                raw = query.payload.to_bytes() if query.payload is not None else b""
+                envelope = _unpack(raw)
                 if envelope.get("protocol_version") != PROTOCOL_VERSION:
                     raise ValueError(
                         f"protocol mismatch: request={envelope.get('protocol_version')} server={PROTOCOL_VERSION}"

@@ -165,6 +165,8 @@ def _build_dataset_metadata(
     state_keys: Sequence[str],
     action_key_dims: Optional[Dict[str, int]] = None,
     state_key_dims: Optional[Dict[str, int]] = None,
+    video_keys: Optional[Sequence[str]] = None,
+    video_resolution: tuple[int, int] = (224, 224),
 ) -> DatasetMetadata:
     """Convert the *combined* stats arrays from ``dataset_statistics.json``
     back into a per-subkey :class:`DatasetMetadata` matching what the training
@@ -250,6 +252,22 @@ def _build_dataset_metadata(
         state_stats, state_meta = _split_combined(state_combined, state_keys, state_key_dims)
         statistics["state"] = state_stats
         modalities["state"] = state_meta
+
+    # Video modality metadata: ``dataset_statistics.json`` does not persist video
+    # stats (empty ``video`` section), but the training transform chain contains
+    # video transforms whose ``set_metadata`` requires a resolution entry per key
+    # (transform/video.py). Unapply only touches state/action, so the resolution
+    # value is inert at serve time — fill each key with the chain's target
+    # resolution so validation passes. (Fixes serve for any ckpt whose DataConfig
+    # has video transforms in its chain, e.g. umi_2gripper_relative_6d.)
+    if video_keys:
+        from starVLA.dataloader.gr00t_lerobot.schema import VideoMetadata
+
+        for full_key in video_keys:
+            sub = full_key.split(".", 1)[1]
+            modalities["video"][sub] = VideoMetadata(
+                resolution=video_resolution, channels=3, fps=30.0
+            )
 
     return DatasetMetadata.model_validate(
         {
@@ -349,9 +367,22 @@ class PolicyNormProcessor:
             state_keys=self._state_keys,
             action_key_dims=self._action_key_dims,
             state_key_dims=self._state_key_dims,
+            video_keys=getattr(self._data_config, "video_keys", None),
         )
         self._transform.set_metadata(ds_meta)
         self._transform.eval()  # mark transforms as eval-mode
+
+        # State/action-only sub-chain: drop VideoTransform instances so that
+        # applying a state-only dict (no ``video.*`` keys) passes — video
+        # transforms assert their keys exist on apply (transform/video.py), but
+        # are skipped by ``ComposedModalityTransform.unapply`` anyway (they are
+        # not invertible). Mirrors the umi_dataset norm-stats pattern (:477).
+        from starVLA.dataloader.gr00t_lerobot.transform.video import VideoTransform
+
+        sa_transforms = [t for t in self._transform.transforms if not isinstance(t, VideoTransform)]
+        self._sa_transform = ComposedModalityTransform(transforms=sa_transforms)
+        self._sa_transform.set_metadata(ds_meta)
+        self._sa_transform.eval()
 
         logger.info(
             "PolicyNormProcessor ready: robot_type=%s, unnorm_key=%s, action_keys=%s (dims=%s), state_keys=%s",
@@ -384,6 +415,12 @@ class PolicyNormProcessor:
     @property
     def transform(self) -> ComposedModalityTransform:
         return self._transform
+
+    @property
+    def sa_transform(self) -> ComposedModalityTransform:
+        """State/action-only sub-chain (video transforms dropped) — for applying
+        state-only dicts without ``video.*`` keys (forward state normalization)."""
+        return self._sa_transform
 
     @property
     def chunk_size(self) -> int:
@@ -438,7 +475,7 @@ class PolicyNormProcessor:
                 if arr.ndim < 2:
                     arr = arr[None, :]
                 state_dict[f"state.{sub}"] = arr
-            state_norm = self._transform.apply(state_dict)
+            state_norm = self._sa_transform.apply(state_dict)
         else:
             state_norm = {}
 

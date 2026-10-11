@@ -1,0 +1,78 @@
+# PI05 · relative-6d (SE(3) 相对位姿 + rotation_6d) UMI run 的开环评测 overlay
+#
+# 跟 ckpt 的 config.full.yaml 合并使用 (eval_starvla.load_merged_config 优先读
+# config.full.yaml, 其次 config.yaml)。本 overlay **只放 eval-specific 字段**, 模型 /
+# 数据 / 训练超参全部从 ckpt config 继承 (framework.*, datasets.vla_data.*), 避免重复。
+#
+# 对应 data_mix=shenzhen_relative_6d, 该 mixture 只有 1 个 entry
+# (20260720061720_lerobot_df899c7d, robot_type=umi_2gripper_relative_6d, 见
+# data_registry/data_config.py), 所以 **不设 dataset_name** —— pick_mixture_entry
+# 会自动挑唯一的 entry。
+#
+# Decode: relative_6d 的相对化由 RelativePoseTransform (训练 transform 链) 完成,
+# 不是 action_mode。eval_starvla._decode_to_raw 直接复用训练 transform 链的 unapply
+# 做精确逆 (min_max 归一化 → rotation_6d→quaternion → SE(3) 相对→绝对), 不依赖
+# invert_action_mode, 对 quaternion / rotation_6d / euler / 关节角等任意表示都成立。
+#
+# 实例 ckpt (20000-step shenzhen relative-6d run):
+#   /nix/data/model_outputs/run_umi_shenzhen_relative_6d_full_20000step/0724_042505
+#   该 run checkpoints/ 下有 steps_{5000,10000,15000,20000}_pytorch_model.pt;
+#   checkpoint_step=null 会自动取最新 (20000)。
+#
+# 用法 A —— 用同目录 launcher (PI05-aware, 推荐):
+#   bash examples/realRobots/zerith_pi05/eval_files/run_umi_pi05_open_eval.sh
+#   bash examples/realRobots/zerith_pi05/eval_files/run_umi_pi05_open_eval.sh --max-anchors 5   # smoke
+#   bash examples/realRobots/zerith_pi05/eval_files/run_umi_pi05_open_eval.sh --visualize        # Stage 1 + 写 .rrd
+#   NUM_PROCESSES=4 bash examples/realRobots/zerith_pi05/eval_files/run_umi_pi05_open_eval.sh     # 多卡
+#
+# 用法 B —— 直接调 eval_starvla (不经过 launcher):
+#   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -m starVLA.training.eval_starvla \
+#     --run-dir /nix/data/model_outputs/run_umi_shenzhen_relative_6d_full_20000step/0724_042505 \
+#     --eval-yaml examples/realRobots/zerith_pi05/eval_files/eval_umi_pi05_relative_6d_overlay.yaml \
+#     --episodes 0 --max-anchors 2          # smoke test
+#
+# 全量评测 (所有 episode): 去掉 --episodes / --max-anchors。
+#
+# ── 换数据集评测 (DATA_MIX_OVERRIDE / --data-mix) ──────────────────────
+# 覆盖 ckpt 的 datasets.vla_data.data_mix (默认 shenzhen_relative_6d)。可选 mixture
+# (同在 /nix/data/z-umi、同 embodiment umi_2gripper_relative_6d, 见
+# train_files/data_registry/data_config.py 的 DATASET_NAMED_MIXTURES):
+#   shenzhen / shenzhen_relative_6d / hefei_relative_6d
+#
+# 用法 A (launcher):
+#   DATA_MIX_OVERRIDE=hefei_relative_6d \
+#     bash examples/realRobots/zerith_pi05/eval_files/run_umi_pi05_open_eval.sh --max-anchors 2
+# 用法 B (直接 eval):
+#   PYTHONPATH=. python -m starVLA.training.eval_starvla \
+#     --run-dir /nix/data/model_outputs/run_umi_shenzhen_relative_6d_full_20000step/0724_042505 \
+#     --eval-yaml examples/realRobots/zerith_pi05/eval_files/eval_umi_pi05_relative_6d_overlay.yaml \
+#     --data-mix hefei_relative_6d --episodes 0 --max-anchors 2
+#
+# 产物隔离: 换数据集时 output_dir 自动追加 _mix-{name}, 不覆盖原数据集结果:
+#   playground/Evals/0724_042505_step20000_seed42_mix-hefei_relative_6d/episode_0/
+#
+# ⚠️ 统计量隐患: model.norm_stats 来自 ckpt 固化的 dataset_statistics.json (训练时 shenzhen
+#   统计量), 而 dataset 用新数据集目录的 stats —— 两者归一化空间不一致。换不同分布数据集后
+#   开环 MSE/ADE 不可定量比较, 仅适用于 pipeline 验证 / Rerun 可视化 / 同 embodiment 烟测。
+#   要可比的跨数据集泛化数字需额外对齐 norm_stats (本次未做)。
+
+eval:
+  # ── 采样 ───────────────────────────────────────────────────────────
+  episode_id: 0                      # 默认单 episode; CLI --episodes 0 1 2 覆盖
+  checkpoint_step: null              # null = 用最新可用 step
+  max_anchors: null                  # null = 整段 episode
+
+  # ── 推理 ───────────────────────────────────────────────────────────
+  batch_size: 8                      # DataLoader batch_size (视频已前置缓存,数据不卡,可开大;按显存 --batch-size 覆盖)
+  seed: 42                           # 单 seed 控 flow-matching 噪声 (多卡也用全局 seed, 可复现)
+  device: cuda
+  dtype: bf16
+  # horizon_step: 1                  # 可选: 从 action chunk 里挑哪一步放进 action_gt (默认 1)
+  #   —— 纯 chunk 下标, 跟"下一帧"无关。UMI viz 上 1 让 gt 跟 obs 视觉重合。
+
+  # ── 输出 ───────────────────────────────────────────────────────────
+  output_root: playground/Evals
+  # 观测图像 sidecar (给 Stage 2 的 rrd 带图像): rank 0 取每 anchor 的 wrist 帧降采样
+  # 写 obs_images.npz。dump 失败只警告不中断 eval; 无 video key 的数据集自动跳过。
+  # dump_obs_images: true        # 默认 true; false 则不写 sidecar, rrd 无图
+  # obs_image_long_side: 320     # 降采样长边像素 (保比例), 默认 320

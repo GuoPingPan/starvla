@@ -303,6 +303,74 @@ class VideoCrop(VideoTransform):
             ), f"Video {key} has invalid shape {height, width}, expected {self.height, self.width}"
 
 
+class VideoCenterCrop(VideoTransform):
+    """Center crop to a target aspect ratio (train/eval both deterministic, no randomness).
+
+    Unlike ``VideoCrop``:
+    - Does not override ``check_input`` → only validates dtype/ndim, **not** resolution, so it
+      accepts arbitrarily-sized raw frames (e.g. 2704x2028).
+    - The crop target is expressed as a **target aspect ratio** (target H:W), not fixed pixels or
+      a per-axis scale, so it adapts to inputs of any resolution.
+
+    Args:
+        crop_ratio: target **H:W** aspect ratio of the cropped output.
+            - scalar ``a`` is equivalent to ``(a, 1)``, i.e. target H:W = a:1.
+            - ``1.0`` → target 1:1 square (crops to ``min(H,W) x min(H,W)``, removes aspect ratio;
+              one config adapts to all resolutions).
+            - ``(rh, rw)`` → target H:W = rh:rw, e.g. ``(1, 2)`` = 1:2 landscape, ``(2, 1)`` = portrait.
+
+        The crop always fits inside the original frame (the largest centered rectangle of the
+        target aspect ratio that fits; never upscales, never pads).
+
+    Examples (input H x W):
+        - 2704x2028, crop_ratio=1.0    -> 2028x2028 (square, take min edge)
+        - 1000x1600, crop_ratio=1.0    -> 1000x1000 (adapts to a different resolution)
+        - 2704x2028, crop_ratio=(1, 2) -> 1014x2028 (1:2 landscape, height-bound)
+        - 2704x2028, crop_ratio=2.0    -> 2704x1352 (2:1 portrait, width-bound)
+    """
+
+    crop_ratio: float | tuple[float, float] = Field(
+        default=1.0,
+        description="Target H:W aspect ratio of the cropped output. scalar=(a,1); 1.0=square.",
+    )
+
+    def _target_aspect(self) -> float:
+        """Return the target H/W ratio (scalar a is treated as a:1)."""
+        r = self.crop_ratio
+        if isinstance(r, (int, float)):
+            return float(r)  # a:1
+        rh, rw = float(r[0]), float(r[1])
+        assert rw > 0, "crop_ratio width component must be > 0"
+        return rh / rw
+
+    def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable:
+        """Return the aspect-ratio center-crop callable. Same for train/eval (deterministic).
+
+        ``apply()`` feeds the whole [N, C, H, W] batch at once; resolution is uniform within the
+        batch, so reading ``frames.shape[-2:]`` gives the true H/W.
+        """
+        aspect = self._target_aspect()  # target H/W
+
+        def _center_crop_aspect(frames: torch.Tensor) -> torch.Tensor:
+            # frames: [N, C, H, W] float in [0,1]
+            _, _, h, w = frames.shape
+            # Largest centered rectangle of target H:W=aspect that fits in the frame:
+            #   try width-bound cw=w -> ch=w*aspect; if ch exceeds frame height, go height-bound
+            #   ch=h -> cw=h/aspect.
+            cw = w
+            ch = int(round(w * aspect))
+            if ch > h:  # height-bound
+                ch = h
+                cw = int(round(h / aspect))
+            ch = min(ch, h)
+            cw = min(cw, w)
+            top = (h - ch) // 2
+            left = (w - cw) // 2
+            return frames[:, :, top : top + ch, left : left + cw]
+
+        return _center_crop_aspect
+
+
 class VideoResize(VideoTransform):
     height: int = Field(..., description="The height of the resize")
     width: int = Field(..., description="The width of the resize")
@@ -526,6 +594,13 @@ class VideoToTensor(VideoTransform):
     def check_input(self, data: dict):
         """Check if the input data has the correct shape.
         Expected video shape: [T, H, W, C], dtype np.uint8
+
+        Note: resolution is intentionally NOT validated here. In a multi-dataset
+        mixture, datasets of the same robot_type share one transform instance, so
+        ``original_resolutions`` is last-writer-wins and cannot track per-dataset
+        raw resolutions. The downstream ``VideoCenterCrop`` + ``VideoResize`` read
+        the true frame size at runtime and resize to a fixed target, so any raw
+        resolution is handled correctly regardless.
         """
         for key in self.apply_to:
             assert key in data, f"Key {key} not found in data. Available keys: {data.keys()}"
@@ -536,14 +611,6 @@ class VideoToTensor(VideoTransform):
             assert (
                 data[key].dtype == np.uint8
             ), f"Video {key} must have dtype uint8, got {data[key].dtype}"
-            input_resolution = data[key].shape[-3:-1][::-1]
-            if key in self.original_resolutions:
-                expected_resolution = self.original_resolutions[key]
-            else:
-                expected_resolution = input_resolution
-            assert (
-                input_resolution == expected_resolution
-            ), f"Video {key} has invalid resolution {input_resolution}, expected {expected_resolution}. Full shape: {data[key].shape}"
 
     @staticmethod
     def to_tensor(frames: np.ndarray) -> torch.Tensor:

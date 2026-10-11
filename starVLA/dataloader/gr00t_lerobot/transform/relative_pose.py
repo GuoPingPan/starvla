@@ -9,7 +9,7 @@ multiplication instead of element-wise subtraction. Compatible with starVLA's
 ModalityTransform architecture.
 """
 
-from typing import List, Dict
+from typing import List, Dict, Literal
 from copy import deepcopy
 
 import torch
@@ -88,6 +88,10 @@ class RelativePoseTransform(InvertibleModalityTransform):
         default="quaternion",
         description="Input rotation representation ('quaternion' or 'euler').",
     )
+    input_quaternion_convention: Literal["xyzw", "wxyz"] = Field(
+        default="xyzw",
+        description="Quaternion component order in the input and output pose.",
+    )
     euler_convention: str = Field(
         default="XYZ",
         description="Euler angle convention for euler inputs.",
@@ -105,6 +109,7 @@ class RelativePoseTransform(InvertibleModalityTransform):
                 "state_keys_map",
                 "split_pose_keys",
                 "input_rotation_type",
+                "input_quaternion_convention",
                 "euler_convention",
             }
         else:
@@ -121,6 +126,23 @@ class RelativePoseTransform(InvertibleModalityTransform):
     def _concat_pose(self, position: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
         """Concatenate position + rotation into a single pose tensor."""
         return torch.cat([position, rotation], dim=-1)
+
+    def _to_xyzw(self, quaternion: torch.Tensor) -> torch.Tensor:
+        """Convert dataset quaternions to the convention used by SE(3) helpers."""
+        if self.input_quaternion_convention == "wxyz":
+            return quaternion[..., [1, 2, 3, 0]]
+        return quaternion
+
+    def _from_xyzw(self, quaternion: torch.Tensor) -> torch.Tensor:
+        if self.input_quaternion_convention == "wxyz":
+            return quaternion[..., [3, 0, 1, 2]]
+        return quaternion
+
+    def _pose_to_xyzw(self, pose: torch.Tensor) -> torch.Tensor:
+        return torch.cat([pose[..., :3], self._to_xyzw(pose[..., 3:7])], dim=-1)
+
+    def _pose_from_xyzw(self, pose: torch.Tensor) -> torch.Tensor:
+        return torch.cat([pose[..., :3], self._from_xyzw(pose[..., 3:7])], dim=-1)
 
     def _extract_last_pose(self, state_pose: torch.Tensor) -> torch.Tensor:
         """Extract the last frame (most recent observation) as the base pose."""
@@ -276,10 +298,10 @@ class RelativePoseTransform(InvertibleModalityTransform):
         assert pose.shape[-1] == 7, f"Expected 7D quaternion pose, got {pose.shape}"
         assert base_pose.shape[-1] == 7, f"Expected 7D quaternion base pose, got {base_pose.shape}"
 
-        pose_matrix = self._pose_to_matrix(pose)
-        base_pose_matrix = self._pose_to_matrix(base_pose)
+        pose_matrix = self._pose_to_matrix(self._pose_to_xyzw(pose))
+        base_pose_matrix = self._pose_to_matrix(self._pose_to_xyzw(base_pose))
         pose_matrix = self._absolute_to_relative(pose_matrix, base_pose_matrix)
-        return self._matrix_to_pose(pose_matrix)
+        return self._pose_from_xyzw(self._matrix_to_pose(pose_matrix))
 
     def _backward(self, pose: torch.Tensor, base_pose: torch.Tensor) -> torch.Tensor:
         """
@@ -299,10 +321,10 @@ class RelativePoseTransform(InvertibleModalityTransform):
         assert pose.shape[-1] == 7, f"Expected 7D quaternion pose, got {pose.shape}"
         assert base_pose.shape[-1] == 7, f"Expected 7D quaternion base pose, got {base_pose.shape}"
 
-        pose_matrix = self._pose_to_matrix(pose)
-        base_pose_matrix = self._pose_to_matrix(base_pose)
+        pose_matrix = self._pose_to_matrix(self._pose_to_xyzw(pose))
+        base_pose_matrix = self._pose_to_matrix(self._pose_to_xyzw(base_pose))
         pose_matrix = self._relative_to_absolute(pose_matrix, base_pose_matrix)
-        return self._matrix_to_pose(pose_matrix)
+        return self._pose_from_xyzw(self._matrix_to_pose(pose_matrix))
 
     @staticmethod
     def _pose_to_matrix(pose: torch.Tensor) -> torch.Tensor:
@@ -435,12 +457,12 @@ class RelativePoseTransform(InvertibleModalityTransform):
         assert pose.shape[-1] == 7, f"Expected 7D quaternion pose, got {pose.shape}"
         assert base_pose.shape[-1] == 7, f"Expected 7D quaternion base pose, got {base_pose.shape}"
 
-        # Extract position and quaternion (i, j, k, r format from dataset)
+        # JIT helpers operate on xyzw; convert wxyz datasets at the boundary.
         p_target = pose[..., :3]
-        q_target = pose[..., 3:7]
+        q_target = self._to_xyzw(pose[..., 3:7])
 
         p_base = base_pose[..., :3]
-        q_base = base_pose[..., 3:7]
+        q_base = self._to_xyzw(base_pose[..., 3:7])
 
         # Compute relative pose with JIT functions
         # p_rel = R_base^T * (p_target - p_base)
@@ -451,7 +473,7 @@ class RelativePoseTransform(InvertibleModalityTransform):
         # q_rel = q_base^{-1} * q_target
         q_rel = quaternion_multiply_jit(q_base_conj, q_target)
 
-        return torch.cat([p_rel, q_rel], dim=-1)
+        return torch.cat([p_rel, self._from_xyzw(q_rel)], dim=-1)
 
     def _backward_fast(self, pose: torch.Tensor, base_pose: torch.Tensor) -> torch.Tensor:
         """
@@ -465,12 +487,12 @@ class RelativePoseTransform(InvertibleModalityTransform):
         assert pose.shape[-1] == 7, f"Expected 7D quaternion pose, got {pose.shape}"
         assert base_pose.shape[-1] == 7, f"Expected 7D quaternion base pose, got {base_pose.shape}"
 
-        # Extract position and quaternion (i, j, k, r format)
+        # JIT helpers operate on xyzw; convert wxyz datasets at the boundary.
         p_rel = pose[..., :3]
-        q_rel = pose[..., 3:7]
+        q_rel = self._to_xyzw(pose[..., 3:7])
 
         p_base = base_pose[..., :3]
-        q_base = base_pose[..., 3:7]
+        q_base = self._to_xyzw(base_pose[..., 3:7])
 
         # Compute absolute pose with JIT functions
         # p_target = R_base * p_rel + p_base
@@ -479,7 +501,7 @@ class RelativePoseTransform(InvertibleModalityTransform):
         # q_target = q_base * q_rel
         q_target = quaternion_multiply_jit(q_base, q_rel)
 
-        return torch.cat([p_target, q_target], dim=-1)
+        return torch.cat([p_target, self._from_xyzw(q_target)], dim=-1)
 
 
 class RelativeJointTransform(InvertibleModalityTransform):
